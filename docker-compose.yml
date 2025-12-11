@@ -1,0 +1,47 @@
+version: '3.8'
+
+services:
+  tenderpost-scraper:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # Enable BuildKit for better caching
+      args:
+        BUILDKIT_INLINE_CACHE: 1
+    container_name: tenderpost-scraper
+    ports:
+      - "8000:8000"
+    environment:
+      - TWOCAPTCHA_API_KEY=${TWOCAPTCHA_API_KEY}
+      - SUPABASE_URL=${SUPABASE_URL:-}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY:-}
+      - DEBUG=${DEBUG:-false}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - MAX_PAGES=${MAX_PAGES:-200}
+      - PAGE_TIMEOUT=${PAGE_TIMEOUT:-30000}
+      - ENVIRONMENT=production
+    volumes:
+      - ./logs:/app/logs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 512M
+    # Logging
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+

@@ -1,0 +1,39 @@
+version: '3.8'
+
+services:
+  tenderpost-scraper-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # Enable BuildKit for better caching
+      args:
+        BUILDKIT_INLINE_CACHE: 1
+    container_name: tenderpost-scraper-dev
+    ports:
+      - "8000:8000"
+    environment:
+      - TWOCAPTCHA_API_KEY=${TWOCAPTCHA_API_KEY}
+      - SUPABASE_URL=${SUPABASE_URL:-}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY:-}
+      - DEBUG=true
+      - LOG_LEVEL=DEBUG
+      - MAX_PAGES=200  # Scrape all pages (up to 200)
+      - PAGE_TIMEOUT=30000
+      - ENVIRONMENT=development
+    volumes:
+      - ./logs:/app/logs
+      # Mount source code for hot reload (if using --reload)
+      - .:/app
+    restart: "no"  # Don't auto-restart in dev mode
+    # Run in foreground with debug output
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--log-level", "debug"]
+    # Increase resource limits for debugging
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+    # Enable TTY for colored output
+    tty: true
+    stdin_open: true
+
