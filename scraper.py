@@ -523,8 +523,18 @@ async def scrape_tenders_crawl4ai_playwright() -> Dict[str, any]:
 
                 # Click next page
                 await next_button.click()
-                await asyncio.sleep(3)  # Wait for page load
-                await page.wait_for_load_state("networkidle", timeout=PAGE_TIMEOUT)
+
+                try:
+                    await page.wait_for_load_state("domcontentloaded", timeout=10000)
+                except Exception:
+                    log_step("Pagination", "warning", {"message": "domcontentloaded timeout, waiting for table"})
+                    # Wait for table to load even if domcontentloaded timed out
+                    try:
+                        await page.wait_for_selector(RESULTS_TABLE_SELECTOR, timeout=15000)
+                    except Exception:
+                        log_step("Pagination", "warning", {"message": "Table selector timeout, continuing anyway"})
+
+                await asyncio.sleep(2)
                 current_page += 1
 
                 # Extract HTML directly from Playwright
@@ -634,8 +644,18 @@ async def scrape_latest_active_tenders() -> Dict[str, any]:
                     break
 
                 await next_button.click()
-                await asyncio.sleep(3)
-                await page.wait_for_load_state("networkidle", timeout=PAGE_TIMEOUT)
+
+                try:
+                    await page.wait_for_load_state("domcontentloaded", timeout=10000)
+                except Exception:
+                    log_step("Pagination", "warning", {"message": "domcontentloaded timeout, waiting for table"})
+                    # Wait for table to load even if domcontentloaded timed out
+                    try:
+                        await page.wait_for_selector(RESULTS_TABLE_SELECTOR, timeout=15000)
+                    except Exception:
+                        log_step("Pagination", "warning", {"message": "Table selector timeout, continuing anyway"})
+
+                await asyncio.sleep(2)
                 current_page += 1
 
                 # Extract HTML directly
