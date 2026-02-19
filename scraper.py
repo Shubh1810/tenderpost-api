@@ -720,7 +720,7 @@ async def scrape_tenders_crawl4ai_playwright() -> Dict:
 # ── Latest active tenders (same inline detail scraping) ──────────────────────
 
 async def scrape_latest_active_tenders() -> Dict:
-    """Scrape latest active tenders page (no CAPTCHA required)."""
+    """Scrap latest active tenders page (no CAPTCHA required)."""
     log_step("Latest Tenders Scraper", "initiated", {"url": LATEST_TENDERS_URL})
 
     tenders_list: List[TenderItem] = []
