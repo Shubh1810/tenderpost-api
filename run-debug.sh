@@ -46,6 +46,13 @@ if [ -z "$TWOCAPTCHA_API_KEY" ] || [ "$TWOCAPTCHA_API_KEY" = "your_2captcha_api_
 fi
 
 echo "✅ 2Captcha API key detected: ${TWOCAPTCHA_API_KEY:0:8}..."
+
+if [ -z "$CLOUDFLARE_API_TOKEN" ] || [ "$CLOUDFLARE_API_TOKEN" = "<your_cf_api_token>" ]; then
+    echo "⚠️  WARNING: CLOUDFLARE_API_TOKEN not set — Cloudflare crawl will be skipped"
+    echo "   Set CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID in .env to enable"
+else
+    echo "✅ Cloudflare API token detected: ${CLOUDFLARE_API_TOKEN:0:8}..."
+fi
 echo ""
 
 # Stop any existing containers

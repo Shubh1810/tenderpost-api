@@ -2,10 +2,11 @@
 FastAPI application for TenderPost scraper.
 
 Endpoints:
-- GET /api/tenders - Get tender data with optional force_refresh
+- GET /api/tenders        - Get tender data (listing only; detail via Cloudflare cron)
 - GET /api/tenders/latest - Get latest active tenders (no CAPTCHA)
-- GET /health - Health check endpoint
-- GET /api/test-2captcha - Test 2Captcha connectivity
+- GET /api/tenders/status - Scrape pipeline health and data completeness metrics
+- GET /health             - Health check endpoint
+- GET /api/test-2captcha  - Test 2Captcha connectivity
 """
 
 import os
@@ -17,7 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from captcha.solver import test_2captcha_connectivity
-from scraper import scrape_latest_active_tenders, scrape_tenders_crawl4ai_playwright
+from scraper import scrape_latest_active_tenders, scrape_listing_pages, scrape_tenders_crawl4ai_playwright
 from supabase_client import save_to_supabase
 
 # Load environment variables
@@ -84,6 +85,17 @@ class CaptchaTestResponse(BaseModel):
     api_key_present: bool
 
 
+class ScrapeStatusResponse(BaseModel):
+    """Data completeness metrics for the scrape pipeline."""
+
+    tender_count: int = Field(..., description="Total tenders in database")
+    detail_scraped_count: int = Field(..., description="Tenders with detail fields populated")
+    pending_detail_count: int = Field(..., description="Tenders awaiting detail extraction")
+    embedding_pending_count: int = Field(..., description="Tenders without embeddings yet")
+    cloudflare_enabled: bool = Field(..., description="Whether USE_CLOUDFLARE=true")
+    last_updated_at: Optional[str] = Field(None, description="ISO timestamp of most-recently updated tender")
+
+
 # ==================== Endpoints ====================
 
 
@@ -97,7 +109,9 @@ async def root() -> dict:
         "endpoints": {
             "health": "/health",
             "tenders": "/api/tenders",
+            "tenders_free": "/api/tenders/free",
             "latest_tenders": "/api/tenders/latest",
+            "scrape_status": "/api/tenders/status",
             "test_captcha": "/api/test-2captcha",
             "docs": "/docs",
         },
@@ -277,6 +291,115 @@ async def get_latest_tenders(
         )
 
 
+@app.get("/api/tenders/free", response_model=TendersResponse, tags=["Tenders"])
+async def get_tenders_free(
+    debug: bool = Query(False, description="Enable debug logging"),
+) -> TendersResponse:
+    """
+    Free-tier crawl: scrapes up to 100 listing pages from eProcure Advanced Search.
+
+    Identical to /api/tenders but hard-capped at 100 pages regardless of the
+    MAX_PAGES environment variable. No detail extraction or embeddings are run.
+    """
+    if debug:
+        os.environ["DEBUG"] = "true"
+
+    result = await scrape_listing_pages(max_pages=100)
+
+    if result.get("success") and len(result.get("tenders", [])) > 0:
+        supabase_result = save_to_supabase(
+            tenders=result.get("tenders", []),
+            source="eprocure.gov.in/AdvancedSearch",
+            live_tenders=result.get("live_tenders"),
+        )
+        if supabase_result.get("success"):
+            print(f"✅ Saved snapshot to Supabase: {supabase_result.get('count')} tenders")
+        else:
+            print(f"⚠️  Failed to save to Supabase: {supabase_result.get('error')}")
+
+    if result.get("success"):
+        return TendersResponse(
+            success=True,
+            source="eprocure.gov.in/AdvancedSearch",
+            count=len(result.get("tenders", [])),
+            total_pages=result.get("total_pages", 0),
+            live_tenders=result.get("live_tenders"),
+            items=result.get("tenders", []),
+        )
+    else:
+        return TendersResponse(
+            success=False,
+            source="eprocure.gov.in/AdvancedSearch",
+            count=len(result.get("tenders", [])),
+            total_pages=result.get("total_pages", 0),
+            live_tenders=result.get("live_tenders"),
+            items=result.get("tenders", []),
+            error=result.get("error", "Unknown error occurred"),
+        )
+
+
+@app.get("/api/tenders/status", response_model=ScrapeStatusResponse, tags=["Tenders"])
+async def get_scrape_status() -> ScrapeStatusResponse:
+    """
+    Read-only: query Supabase for scrape pipeline health and data completeness.
+
+    Returns counts of total, detail-scraped, and embedding-pending tenders,
+    plus the timestamp of the most-recently updated tender.
+    Does NOT trigger any scraping.
+    """
+    supabase_url = os.getenv("SUPABASE_URL")
+    supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    cf_enabled   = os.getenv("USE_CLOUDFLARE", "true").lower() == "true"
+
+    if not supabase_url or not supabase_key:
+        return ScrapeStatusResponse(
+            tender_count=0,
+            detail_scraped_count=0,
+            pending_detail_count=0,
+            embedding_pending_count=0,
+            cloudflare_enabled=cf_enabled,
+            last_updated_at=None,
+        )
+
+    from supabase import create_client
+    client = create_client(supabase_url, supabase_key)
+
+    try:
+        total_res   = client.table("tenders").select("id", count="exact").execute()
+        detail_res  = client.table("tenders").select("id", count="exact").eq("detail_scraped", True).execute()
+        pending_res = client.table("tenders").select("id", count="exact").eq("detail_scraped", False).execute()
+        embed_res   = client.table("tenders").select("id", count="exact").is_("embedding", "null").execute()
+        recent_res  = (
+            client.table("tenders")
+            .select("updated_at")
+            .order("updated_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+
+        last_updated = None
+        if recent_res.data:
+            last_updated = recent_res.data[0].get("updated_at")
+
+        return ScrapeStatusResponse(
+            tender_count=total_res.count or 0,
+            detail_scraped_count=detail_res.count or 0,
+            pending_detail_count=pending_res.count or 0,
+            embedding_pending_count=embed_res.count or 0,
+            cloudflare_enabled=cf_enabled,
+            last_updated_at=last_updated,
+        )
+    except Exception as e:
+        return ScrapeStatusResponse(
+            tender_count=0,
+            detail_scraped_count=0,
+            pending_detail_count=0,
+            embedding_pending_count=0,
+            cloudflare_enabled=cf_enabled,
+            last_updated_at=None,
+        )
+
+
 # ==================== Error Handlers ====================
 
 
@@ -319,6 +442,19 @@ async def startup_event():
     else:
         print("⚠️  Supabase: NOT CONFIGURED")
         print("   Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY environment variables")
+
+    # Check Cloudflare Browser Rendering configuration
+    cf_token   = os.getenv("CLOUDFLARE_API_TOKEN")
+    cf_account = os.getenv("CLOUDFLARE_ACCOUNT_ID")
+    cf_enabled = os.getenv("USE_CLOUDFLARE", "true").lower() == "true"
+    if cf_token and cf_account and cf_enabled:
+        print(f"✅ Cloudflare Browser Rendering: Configured (USE_CLOUDFLARE=true)")
+    elif cf_enabled:
+        print("⚠️  Cloudflare Browser Rendering: NOT CONFIGURED")
+        print("   Set CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID")
+        print("   Detail scraping will fall back to direct httpx + Selectolax")
+    else:
+        print("📌 Cloudflare Browser Rendering: Disabled (USE_CLOUDFLARE=false)")
 
     print("=" * 60)
     print("📡 API Documentation: http://localhost:8000/docs")

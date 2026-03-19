@@ -1,18 +1,14 @@
 """
-scraper.py — Main scraping pipeline using Playwright + 2Captcha + Selectolax.
+scraper.py — Playwright listing scraper + Selectolax detail page parser.
 
-Architecture (unchanged):
-- Playwright : Browser automation, navigation, CAPTCHA, pagination
-- 2Captcha   : CAPTCHA solving
-- Selectolax : Fast HTML parsing
+Architecture (hybrid pipeline):
+- Phase 1 (this file): Playwright handles CAPTCHA-protected listing pages only.
+  Collects title, ref_no, dates, organisation, detail_url per tender.
+  Does NOT click into detail pages.
+- Phase 2 (cloudflare_crawl.py): Cloudflare /crawl handles detail page extraction
+  in bulk using AI, with this file's parse_detail_page() as the Selectolax fallback.
 
-What's new (additive only):
-- After extracting each tender from the list page, Playwright clicks into the
-  tender detail page within the SAME session/tab, scrapes rich fields, then
-  clicks the Back anchor to return to the list page.
-- No new browser, no new session, no new CAPTCHA.
-
-Key HTML facts confirmed from source inspection:
+Key HTML facts for eprocure.gov.in:
 - Detail page: all data lives in <table class="tablebg"> — NOT in the nav sidebar.
   The left sidebar also contains <script> tags and nav links — scoping to
   tablebg avoids all contamination.
@@ -23,10 +19,9 @@ Key HTML facts confirmed from source inspection:
       <td class="td_caption">Product Category</td><td class="td_field">Electrical Works</td>
       <td class="td_caption">Sub category</td><td class="td_field">NA</td>
     </tr>
-- Back button is an <a> anchor, confirmed:
-    <a id="DirectLink_11" title="Back" class="customButton_link" value="Back" href="...">Back</a>
 - List page tender links: id="DirectLink_0", "DirectLink_0_0" etc.
   with href containing sp= session token unique per tender.
+  WARNING: sp= tokens may expire — Phase 2 must run immediately after Phase 1.
 """
 
 import asyncio
@@ -59,9 +54,6 @@ RESULTS_TABLE_SELECTOR = "table.list tbody tr"
 # ── Limits ────────────────────────────────────────────────────────────────────
 MAX_PAGES    = int(os.getenv("MAX_PAGES", "200"))
 PAGE_TIMEOUT = int(os.getenv("PAGE_TIMEOUT", "30000"))
-
-# Set SCRAPE_DETAILS=false in .env to disable detail scraping (fast debug mode)
-SCRAPE_DETAILS = os.getenv("SCRAPE_DETAILS", "true").lower() == "true"
 
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -446,131 +438,23 @@ def parse_detail_page(html: str) -> Dict:
     return {k: v for k, v in result.items() if v is not None}
 
 
-# ── Detail scraping with Playwright ──────────────────────────────────────────
-
-async def scrape_detail_page_playwright(page: Page, tender: TenderItem) -> None:
-    """
-    Navigate into a tender detail page within the SAME Playwright session,
-    parse fields with Selectolax, then click the Back anchor to return.
-
-    Navigation strategy:
-    1. Extract the sp= token from the tender's stored URL.
-    2. Find the matching <a href="...sp=TOKEN..."> on the current list page.
-    3. Click it — keeps the Tapestry session perfectly intact.
-    4. Fallback to page.goto(url) if the link isn't found.
-
-    Back navigation (confirmed from HTML):
-      <a id="DirectLink_11" title="Back" class="customButton_link" href="...">Back</a>
-    """
-    if not tender.url:
-        return
-
-    ref_short = (tender.ref_no or "")[:35]
-    log_step("Detail Scrape", "initiated", {"ref": ref_short})
-
-    try:
-        # ── Navigate in ──────────────────────────────────────────────────────
-        sp_match  = re.search(r"sp=([^&]+)", tender.url)
-        navigated = False
-
-        if sp_match:
-            sp_token = sp_match.group(1)
-            link_el  = await page.query_selector(f'a[href*="sp={sp_token}"]')
-            if link_el:
-                await link_el.click()
-                navigated = True
-
-        if not navigated:
-            # Fallback: direct navigation, session cookie still intact
-            await page.goto(tender.url, wait_until="domcontentloaded", timeout=15000)
-
-        # Wait for the data tables to appear
-        try:
-            await page.wait_for_selector("table.tablebg", timeout=10000)
-        except Exception:
-            pass
-
-        await asyncio.sleep(0.8)
-
-        # ── Parse ────────────────────────────────────────────────────────────
-        html   = await page.content()
-        fields = parse_detail_page(html)
-
-        for key, val in fields.items():
-            if hasattr(tender, key):
-                setattr(tender, key, val)
-
-        log_step("Detail Scrape", "success", {
-            "ref":          ref_short,
-            "fields_found": len(fields),
-            "category":     fields.get("product_category", "N/A"),
-            "value":        fields.get("tender_value", "N/A"),
-            "location":     fields.get("location", "N/A"),
-        })
-
-        # ── Click Back anchor ─────────────────────────────────────────────────
-        # Confirmed: <a title="Back" class="customButton_link" ...>Back</a>
-        # NOT an <input type="button"> — it's an anchor.
-        back_clicked = False
-
-        # Primary selector — most reliable, matches the confirmed HTML exactly
-        back_el = await page.query_selector('a[title="Back"]')
-        if back_el:
-            await back_el.click()
-            back_clicked = True
-
-        # Secondary: class match
-        if not back_clicked:
-            for a in await page.query_selector_all("a.customButton_link"):
-                try:
-                    if (await a.inner_text()).strip().lower() == "back":
-                        await a.click()
-                        back_clicked = True
-                        break
-                except Exception:
-                    continue
-
-        # Tertiary: text match on any anchor
-        if not back_clicked:
-            for a in await page.query_selector_all("a"):
-                try:
-                    if (await a.inner_text()).strip() == "Back":
-                        await a.click()
-                        back_clicked = True
-                        break
-                except Exception:
-                    continue
-
-        if not back_clicked:
-            log_step("Detail Scrape", "warning",
-                     {"action": "Back anchor not found, using page.go_back()"})
-            await page.go_back()
-
-        # Wait for list table to reappear before continuing
-        try:
-            await page.wait_for_selector("table#table, table.list_table", timeout=10000)
-        except Exception:
-            try:
-                await page.wait_for_load_state("domcontentloaded", timeout=8000)
-            except Exception:
-                pass
-
-        await asyncio.sleep(1.0)
-
-    except Exception as e:
-        log_step("Detail Scrape", "error", {"ref": ref_short, "error": str(e)})
-        try:
-            await page.go_back()
-            await asyncio.sleep(1.5)
-        except Exception:
-            pass
-
-
 # ── Main scraping pipeline ────────────────────────────────────────────────────
 
-async def scrape_tenders_crawl4ai_playwright() -> Dict:
+async def scrape_listing_pages(max_pages: Optional[int] = None) -> Dict:
     """
-    Complete pipeline: list scrape + inline detail scrape in one browser session.
+    Phase 1 of the hybrid pipeline: scrape listing pages only.
+
+    Handles CAPTCHA, form submission, and pagination. Does NOT click into
+    any detail pages. Each TenderItem is returned with only its 7 list-page
+    fields populated:
+        title, ref_no, closing_date, opening_date, published_date,
+        organisation, url
+
+    The url field contains the detail page URL (with sp= session token) that
+    Phase 2 (cloudflare_crawl.py) will use for bulk detail extraction.
+
+    Args:
+        max_pages: Override the MAX_PAGES env var limit. Defaults to MAX_PAGES.
 
     Returns:
         {
@@ -578,11 +462,13 @@ async def scrape_tenders_crawl4ai_playwright() -> Dict:
             "tenders":      List[Dict],
             "total_pages":  int,
             "live_tenders": Optional[int],
+            "error":        Optional[str],
         }
     """
-    log_step("Scraper Pipeline", "initiated",
+    page_limit = max_pages if max_pages is not None else MAX_PAGES
+    log_step("Listing Scraper", "initiated",
              {"framework": "Playwright + 2Captcha + Selectolax",
-              "detail_scraping": SCRAPE_DETAILS})
+              "max_pages": page_limit})
 
     tenders_list: List[TenderItem] = []
     current_page = 0
@@ -621,7 +507,7 @@ async def scrape_tenders_crawl4ai_playwright() -> Dict:
             if not await handle_captcha_if_present(page):
                 await browser.close()
                 return {"success": False, "error": "CAPTCHA solving failed",
-                        "tenders": []}
+                        "tenders": [], "total_pages": 0}
 
             # STEP 3: Select tender type and submit
             for sel in TENDER_TYPE_SELECTORS:
@@ -639,7 +525,7 @@ async def scrape_tenders_crawl4ai_playwright() -> Dict:
             await page.wait_for_load_state("networkidle", timeout=PAGE_TIMEOUT)
             log_step("Form Submission", "success", {"status": "Results loaded"})
 
-            # STEP 4: Paginate, extract, detail-scrape
+            # STEP 4: Paginate and extract list-page fields only
             while True:
                 current_page += 1
                 html         = await page.content()
@@ -651,21 +537,11 @@ async def scrape_tenders_crawl4ai_playwright() -> Dict:
                     "running": len(tenders_list) + len(page_tenders),
                 })
 
-                if SCRAPE_DETAILS:
-                    for i, tender in enumerate(page_tenders):
-                        if tender.url:
-                            log_step("Detail Progress", "processing", {
-                                "progress": f"{i+1}/{len(page_tenders)} on page {current_page}",
-                                "ref":      (tender.ref_no or "")[:35],
-                            })
-                            await scrape_detail_page_playwright(page, tender)
-                            await asyncio.sleep(1.2)
-
                 tenders_list.extend(page_tenders)
 
-                if current_page >= MAX_PAGES:
+                if current_page >= page_limit:
                     log_step("Pagination", "success",
-                             {"status": f"Reached MAX_PAGES={MAX_PAGES}"})
+                             {"status": f"Reached max_pages={page_limit}"})
                     break
 
                 next_btn = await find_exact_next_button(page)
@@ -693,11 +569,10 @@ async def scrape_tenders_crawl4ai_playwright() -> Dict:
 
             await browser.close()
 
-        log_step("Scraper Pipeline", "success", {
-            "total_tenders":  len(tenders_list),
-            "total_pages":    current_page,
-            "live_tenders":   total_live or "N/A",
-            "detail_scraped": SCRAPE_DETAILS,
+        log_step("Listing Scraper", "success", {
+            "total_tenders": len(tenders_list),
+            "total_pages":   current_page,
+            "live_tenders":  total_live or "N/A",
         })
 
         return {
@@ -708,7 +583,7 @@ async def scrape_tenders_crawl4ai_playwright() -> Dict:
         }
 
     except Exception as e:
-        log_step("Scraper Pipeline", "error", {"error": str(e)})
+        log_step("Listing Scraper", "error", {"error": str(e)})
         return {
             "success":     False,
             "error":       str(e),
@@ -717,10 +592,21 @@ async def scrape_tenders_crawl4ai_playwright() -> Dict:
         }
 
 
-# ── Latest active tenders (same inline detail scraping) ──────────────────────
+# Backward-compat alias used by main.py
+async def scrape_tenders_crawl4ai_playwright() -> Dict:
+    """Alias for scrape_listing_pages(). Kept for backward compatibility."""
+    return await scrape_listing_pages()
+
+
+# ── Latest active tenders (listing only, no CAPTCHA) ─────────────────────────
 
 async def scrape_latest_active_tenders() -> Dict:
-    """Scrap latest active tenders page (no CAPTCHA required)."""
+    """
+    Scrape latest active tenders page (no CAPTCHA required).
+
+    Returns only list-page fields. Detail extraction is handled by
+    cloudflare_crawl.crawl_detail_pages() in the cron pipeline.
+    """
     log_step("Latest Tenders Scraper", "initiated", {"url": LATEST_TENDERS_URL})
 
     tenders_list: List[TenderItem] = []
@@ -750,16 +636,6 @@ async def scrape_latest_active_tenders() -> Dict:
                 log_step("Page Extraction", "success", {
                     "page": current_page, "tenders": len(page_tenders),
                 })
-
-                if SCRAPE_DETAILS:
-                    for i, tender in enumerate(page_tenders):
-                        if tender.url:
-                            log_step("Detail Progress", "processing", {
-                                "progress": f"{i+1}/{len(page_tenders)} on page {current_page}",
-                                "ref":      (tender.ref_no or "")[:35],
-                            })
-                            await scrape_detail_page_playwright(page, tender)
-                            await asyncio.sleep(1.2)
 
                 tenders_list.extend(page_tenders)
 
