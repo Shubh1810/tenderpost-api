@@ -86,70 +86,15 @@ _CPPP_JSON_OPTIONS = {
         "(Central Public Procurement Portal) page. The table has columns: "
         "Sl.No, e-Published Date, Bid Submission Closing Date, Tender Opening Date, "
         "Title/Ref.No./Tender Id, Organisation Name, Corrigendum. "
-        "Each row is one tender. Also extract the href attribute of the link in the "
-        "Title/Ref.No./Tender Id column (it links to /cppp/tendersfullview/...). "
-        "Return all rows found on this page as an array."
+        "Each row is one tender. Return a JSON object with a 'tenders' array where "
+        "each element has: serial_no (integer), published_date (string), "
+        "closing_date (string), opening_date (string), tender_id (string — the "
+        "reference/ID number from the Title column), title (string — the tender "
+        "description), organisation (string), detail_path (string — the href of the "
+        "link in the Title column, e.g. /cppp/tendersfullview/...), "
+        "corrigendum (string). Also include page_number (integer) and "
+        "total_records (integer) if visible on the page."
     ),
-    "schema": {
-        "type": "object",
-        "required": [],
-        "properties": {
-            "tenders": {
-                "type": "array",
-                "description": "All tender rows extracted from the listing table",
-                "items": {
-                    "type": "object",
-                    "required": [],
-                    "properties": {
-                        "serial_no": {
-                            "type": "integer",
-                            "description": "Row serial number (Sl.No column)"
-                        },
-                        "published_date": {
-                            "type": "string",
-                            "description": "e-Published Date (e.g. 19-Mar-2026 06:05 PM)"
-                        },
-                        "closing_date": {
-                            "type": "string",
-                            "description": "Bid Submission Closing Date"
-                        },
-                        "opening_date": {
-                            "type": "string",
-                            "description": "Tender Opening Date"
-                        },
-                        "tender_id": {
-                            "type": "string",
-                            "description": "Tender ID / Reference number from Title column"
-                        },
-                        "title": {
-                            "type": "string",
-                            "description": "Tender title/description from Title column"
-                        },
-                        "organisation": {
-                            "type": "string",
-                            "description": "Organisation Name"
-                        },
-                        "detail_path": {
-                            "type": "string",
-                            "description": "href of the link in the Title column (e.g. /cppp/tendersfullview/...)"
-                        },
-                        "corrigendum": {
-                            "type": "string",
-                            "description": "Corrigendum column value (-- if none)"
-                        }
-                    }
-                }
-            },
-            "page_number": {
-                "type": "integer",
-                "description": "Current page number from the pagination area"
-            },
-            "total_records": {
-                "type": "integer",
-                "description": "Total number of records shown on the page (e.g. 30954)"
-            }
-        }
-    }
 }
 
 
@@ -160,76 +105,15 @@ _JSON_OPTIONS = {
         "Extract structured data from this Indian government eProcurement tender "
         "detail page (eprocure.gov.in). All data is inside tables with class "
         "'tablebg'. Label cells have class 'td_caption', value cells have class "
-        "'td_field'. Tender Value and EMD Amount are displayed with Indian-style "
-        "comma formatting (e.g. 3,86,15,626) — extract these as plain numbers "
-        "with no commas, no currency symbol, no text."
+        "'td_field'. Return a JSON object with these fields (omit any that are "
+        "absent or NA): tender_id (string), tender_type (string), tender_category "
+        "(string), contract_type (string, from 'Form Of Contract'), work_description "
+        "(string), product_category (string), sub_category (string), location (string), "
+        "pincode (string), tender_value (number — strip Indian commas and ₹ symbol), "
+        "emd_amount (number — strip Indian commas and ₹ symbol), "
+        "period_of_work_days (integer), bid_validity_days (integer), "
+        "inviting_authority_name (string), inviting_authority_address (string)."
     ),
-    "schema": {
-        "type": "object",
-        "required": [],
-        "properties": {
-            "tender_id": {
-                "type": "string",
-                "description": "Tender ID from the Basic Details section"
-            },
-            "tender_type": {
-                "type": "string",
-                "description": "Tender Type (e.g. Open Tender, Limited Tender)"
-            },
-            "tender_category": {
-                "type": "string",
-                "description": "Tender Category (e.g. Works, Goods, Services)"
-            },
-            "contract_type": {
-                "type": "string",
-                "description": "Form Of Contract field (e.g. Item Rate, Lump Sum)"
-            },
-            "work_description": {
-                "type": "string",
-                "description": "Work Description from the Work Item Details section"
-            },
-            "product_category": {
-                "type": "string",
-                "description": "Product Category (e.g. Electrical Works, Civil Works). Null if NA."
-            },
-            "sub_category": {
-                "type": "string",
-                "description": "Sub category field. Null if NA."
-            },
-            "location": {
-                "type": "string",
-                "description": "Location field in Work Item Details. Null if NA."
-            },
-            "pincode": {
-                "type": "string",
-                "description": "Pincode. Null if NA or empty."
-            },
-            "tender_value": {
-                "type": "number",
-                "description": "Tender Value in rupees as a plain number (no commas, no symbol)"
-            },
-            "emd_amount": {
-                "type": "number",
-                "description": "EMD Amount in rupees as a plain number. From EMD Fee Details section."
-            },
-            "period_of_work_days": {
-                "type": "integer",
-                "description": "Period Of Work expressed in days as an integer"
-            },
-            "bid_validity_days": {
-                "type": "integer",
-                "description": "Bid Validity expressed in days as an integer"
-            },
-            "inviting_authority_name": {
-                "type": "string",
-                "description": "Name from the Tender Inviting Authority section at the bottom"
-            },
-            "inviting_authority_address": {
-                "type": "string",
-                "description": "Address from the Tender Inviting Authority section"
-            },
-        }
-    }
 }
 
 
