@@ -279,15 +279,17 @@ def extract_tenders_from_html(html_content: str) -> List[TenderItem]:
 
             title, ref_no = parse_title_and_ref(title_and_ref)
 
+            # Find the link that carries the sp= session token — not the
+            # Tapestry component links ($DirectLink, $DirectLink_0, etc.)
             tender_url = None
-            link = cells[4].css_first("a")
-            if link:
+            for link in cells[4].css("a"):
                 href = link.attributes.get("href", "")
-                if href:
+                if "sp=" in href:
                     tender_url = (
                         f"https://eprocure.gov.in{href}"
                         if not href.startswith("http") else href
                     )
+                    break
 
             if not is_valid_tender(title, closing_date, opening_date,
                                    published_date, organisation):

@@ -344,9 +344,19 @@ def _build_listing_row(t: Dict) -> Dict:
 
 def _upsert_rows(client, rows: List[Dict], label: str, batch_size: int = 100) -> int:
     """Upsert rows in batches, return count upserted."""
+    # Deduplicate within the list — Supabase throws '21000' if the same
+    # (ref_no, source) appears twice in one command. Last write wins.
+    seen: Dict[tuple, Dict] = {}
+    for r in rows:
+        key = (r.get("ref_no"), r.get("source"))
+        seen[key] = r
+    deduped = list(seen.values())
+    if len(deduped) < len(rows):
+        log_supabase.debug(f"[{label}] Deduplicated {len(rows)} → {len(deduped)} rows")
+
     total = 0
-    for i in range(0, len(rows), batch_size):
-        chunk = rows[i:i + batch_size]
+    for i in range(0, len(deduped), batch_size):
+        chunk = deduped[i:i + batch_size]
         # Omit None values so Supabase doesn't overwrite existing good data
         clean = [{k: v for k, v in r.items() if v is not None} for r in chunk]
         try:
@@ -355,9 +365,9 @@ def _upsert_rows(client, rows: List[Dict], label: str, batch_size: int = 100) ->
                 on_conflict="ref_no,source",
             ).execute()
             total += len(clean)
-            print(f"  [{label}] batch {i // batch_size + 1} — {len(clean)} rows (total {total})")
+            log_supabase.debug(f"[{label}] batch {i // batch_size + 1} — {len(clean)} rows (total {total})")
         except Exception as e:
-            print(f"  ⚠️  [{label}] batch failed: {e}")
+            log_supabase.error(f"[{label}] batch failed: {e}")
     return total
 
 
