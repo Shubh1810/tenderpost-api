@@ -54,8 +54,9 @@ SUBMIT_BUTTON_SELECTOR = 'input[type="submit"][value="Search"]'
 RESULTS_TABLE_SELECTOR = "table.list tbody tr"
 
 # ── Limits ────────────────────────────────────────────────────────────────────
-MAX_PAGES    = int(os.getenv("MAX_PAGES", "200"))
-PAGE_TIMEOUT = int(os.getenv("PAGE_TIMEOUT", "30000"))
+MAX_PAGES     = int(os.getenv("MAX_PAGES", "200"))
+PAGE_TIMEOUT  = int(os.getenv("PAGE_TIMEOUT", "30000"))
+SOLVE_CAPTCHA = os.getenv("SOLVE_CAPTCHA", "true").lower() == "true"
 
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -171,6 +172,10 @@ def is_valid_tender(title, closing_date, opening_date, published_date, organisat
 
 
 async def handle_captcha_if_present(page: Page) -> bool:
+    if not SOLVE_CAPTCHA:
+        log_captcha.info("CAPTCHA solving disabled (SOLVE_CAPTCHA=false) — skipping")
+        return True
+
     log_captcha.info("Checking for CAPTCHA presence...")
     t0 = time.perf_counter()
     try:

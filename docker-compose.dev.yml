@@ -20,6 +20,7 @@ services:
       - CLOUDFLARE_ACCOUNT_ID=${CLOUDFLARE_ACCOUNT_ID:-}
       - USE_CLOUDFLARE=${USE_CLOUDFLARE:-true}
       - SCRAPE_CPPP=${SCRAPE_CPPP:-true}
+      - SOLVE_CAPTCHA=${SOLVE_CAPTCHA:-false}
       - DEBUG=true
       - LOG_LEVEL=DEBUG
       - MAX_PAGES=200
@@ -57,6 +58,12 @@ services:
         - action: sync
           path: ./cloudflare_crawl.py
           target: /app/cloudflare_crawl.py
+        - action: sync
+          path: ./logger.py
+          target: /app/logger.py
+        - action: sync
+          path: ./run_embed.py
+          target: /app/run_embed.py
         # Rebuild only when dependencies change
         - action: rebuild
           path: pyproject.toml
