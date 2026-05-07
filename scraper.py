@@ -27,13 +27,15 @@ Key HTML facts for eprocure.gov.in:
 import asyncio
 import os
 import re
-from typing import Dict, List, Optional, Tuple
+import time
+from typing import Awaitable, Callable, Dict, List, Optional, Tuple
 
 from playwright.async_api import Page, async_playwright
 from selectolax.parser import HTMLParser
 
 from captcha.screenshot import capture_captcha_screenshot, detect_captcha_presence
 from captcha.solver import solve_captcha_2captcha
+from logger import log_captcha, log_scraper, run_summary
 
 
 # ── Target URLs ───────────────────────────────────────────────────────────────
@@ -169,33 +171,36 @@ def is_valid_tender(title, closing_date, opening_date, published_date, organisat
 
 
 async def handle_captcha_if_present(page: Page) -> bool:
-    log_step("CAPTCHA Handler", "initiated", {"action": "Checking for CAPTCHA"})
+    log_captcha.info("Checking for CAPTCHA presence...")
+    t0 = time.perf_counter()
     try:
         if not await detect_captcha_presence(page):
-            log_step("CAPTCHA Handler", "success", {"status": "No CAPTCHA detected"})
+            log_captcha.info("No CAPTCHA detected — proceeding")
+            run_summary.record("captcha_solved", False)
             return True
 
-        log_step("CAPTCHA Handler", "processing", {"status": "CAPTCHA detected, capturing..."})
+        log_captcha.warning("CAPTCHA detected — capturing screenshot and solving...")
         captcha_base64 = await capture_captcha_screenshot(page, enhance=True)
         if not captcha_base64:
-            log_step("CAPTCHA Handler", "error", {"error": "Failed to capture CAPTCHA image"})
+            log_captcha.error("Failed to capture CAPTCHA screenshot")
             return False
 
         solution_result = await solve_captcha_2captcha(captcha_base64)
+        elapsed = time.perf_counter() - t0
+
         if not solution_result.get("success"):
-            log_step("CAPTCHA Handler", "error",
-                     {"error": solution_result.get("error", "Unknown")})
+            log_captcha.error(f"2Captcha solve failed ({elapsed:.1f}s): {solution_result.get('error', 'Unknown')}")
             return False
 
         solution_text = solution_result.get("solution", "")
-        log_step("CAPTCHA Handler", "success",
-                 {"solution": solution_text,
-                  "elapsed": f"{solution_result.get('elapsed_time', 0):.1f}s"})
+        log_captcha.success(f"CAPTCHA solved ({elapsed:.1f}s) — solution={solution_text!r}")
+        run_summary.record("captcha_solved", True)
+        run_summary.record("captcha_time_s", round(elapsed, 1))
         await page.fill(CAPTCHA_INPUT_SELECTOR, solution_text)
         return True
 
     except Exception as e:
-        log_step("CAPTCHA Handler", "error", {"error": str(e)})
+        log_captcha.error(f"CAPTCHA handler exception: {e}")
         return False
 
 
@@ -440,7 +445,12 @@ def parse_detail_page(html: str) -> Dict:
 
 # ── Main scraping pipeline ────────────────────────────────────────────────────
 
-async def scrape_listing_pages(max_pages: Optional[int] = None) -> Dict:
+async def scrape_listing_pages(
+    max_pages: Optional[int] = None,
+    already_detailed: Optional[set] = None,
+    early_stop_pages: int = 3,
+    on_page: Optional[Callable[[List[Dict]], Awaitable[None]]] = None,
+) -> Dict:
     """
     Phase 1 of the hybrid pipeline: scrape listing pages only.
 
@@ -454,7 +464,17 @@ async def scrape_listing_pages(max_pages: Optional[int] = None) -> Dict:
     Phase 2 (cloudflare_crawl.py) will use for bulk detail extraction.
 
     Args:
-        max_pages: Override the MAX_PAGES env var limit. Defaults to MAX_PAGES.
+        max_pages:        Override the MAX_PAGES env var limit. Defaults to MAX_PAGES.
+        already_detailed: Set of ref_nos already fully stored in Supabase. When
+                          provided, pagination stops early after `early_stop_pages`
+                          consecutive pages where every tender is already known.
+                          Tenders are listed newest-first, so a full page of known
+                          ref_nos means we've passed the frontier of new data.
+        early_stop_pages: Number of all-known consecutive pages before stopping.
+        on_page:          Optional async callback called immediately after each page
+                          is extracted, receiving the page's tender dicts. Use this
+                          for per-page checkpoint writes to Supabase so a crash
+                          mid-scrape doesn't lose already-scraped pages.
 
     Returns:
         {
@@ -465,10 +485,13 @@ async def scrape_listing_pages(max_pages: Optional[int] = None) -> Dict:
             "error":        Optional[str],
         }
     """
-    page_limit = max_pages if max_pages is not None else MAX_PAGES
+    page_limit      = max_pages if max_pages is not None else MAX_PAGES
+    known           = already_detailed or set()
+    all_known_streak = 0
     log_step("Listing Scraper", "initiated",
              {"framework": "Playwright + 2Captcha + Selectolax",
-              "max_pages": page_limit})
+              "max_pages": page_limit,
+              "known_detailed": len(known)})
 
     tenders_list: List[TenderItem] = []
     current_page = 0
@@ -497,15 +520,17 @@ async def scrape_listing_pages(max_pages: Optional[int] = None) -> Dict:
             page = await context.new_page()
 
             # STEP 1: Load search form
-            log_step("Navigation", "processing", {"url": ADVANCED_SEARCH_URL})
+            log_scraper.info(f"Navigating to Advanced Search — {ADVANCED_SEARCH_URL}")
+            t_nav = time.perf_counter()
             await page.goto(ADVANCED_SEARCH_URL, wait_until="networkidle",
                             timeout=PAGE_TIMEOUT)
             await page.wait_for_selector(CAPTCHA_INPUT_SELECTOR, timeout=10000)
-            log_step("Navigation", "success", {"status": "Form loaded"})
+            log_scraper.info(f"Search form loaded ({time.perf_counter()-t_nav:.2f}s)")
 
             # STEP 2: Solve CAPTCHA
             if not await handle_captcha_if_present(page):
                 await browser.close()
+                log_scraper.error("CAPTCHA solving failed — aborting scrape")
                 return {"success": False, "error": "CAPTCHA solving failed",
                         "tenders": [], "total_pages": 0}
 
@@ -515,39 +540,81 @@ async def scrape_listing_pages(max_pages: Optional[int] = None) -> Dict:
                     el = await page.query_selector(sel)
                     if el:
                         await page.select_option(sel, value="1")
-                        log_step("Form Filling", "success",
-                                 {"tender_type": "Open Tender"})
+                        log_scraper.info("Tender type set to 'Open Tender' (value=1)")
                         break
                 except Exception:
                     continue
 
+            log_scraper.info("Submitting search form...")
+            t_submit = time.perf_counter()
             await page.click(SUBMIT_BUTTON_SELECTOR)
             await page.wait_for_load_state("networkidle", timeout=PAGE_TIMEOUT)
-            log_step("Form Submission", "success", {"status": "Results loaded"})
+            log_scraper.info(f"Search results loaded ({time.perf_counter()-t_submit:.2f}s)")
 
             # STEP 4: Paginate and extract list-page fields only
             while True:
                 current_page += 1
+                t_page = time.perf_counter()
                 html         = await page.content()
                 page_tenders = extract_tenders_from_html(html)
+                page_time    = time.perf_counter() - t_page
 
-                log_step("Page Extraction", "success", {
-                    "page":    current_page,
-                    "tenders": len(page_tenders),
-                    "running": len(tenders_list) + len(page_tenders),
-                })
+                # Early-stop: count consecutive pages where every valid ref_no
+                # is already fully stored in Supabase. Tenders are sorted
+                # newest-first, so once we're deep into known territory we can stop.
+                if known and page_tenders:
+                    valid_ref_nos = [
+                        t.ref_no for t in page_tenders
+                        if t.ref_no and t.ref_no != "UNKNOWN"
+                    ]
+                    new_on_page = [r for r in valid_ref_nos if r not in known]
+                    if valid_ref_nos and all(r in known for r in valid_ref_nos):
+                        all_known_streak += 1
+                        log_scraper.debug(
+                            f"Page {current_page}: {len(page_tenders)} tenders, "
+                            f"all known (streak={all_known_streak}/{early_stop_pages}) "
+                            f"[{page_time:.2f}s]"
+                        )
+                    else:
+                        all_known_streak = 0
+                        log_scraper.info(
+                            f"Page {current_page}: {len(page_tenders)} tenders — "
+                            f"{len(new_on_page)} new, {len(valid_ref_nos)-len(new_on_page)} known "
+                            f"(running total: {len(tenders_list)+len(page_tenders)}) [{page_time:.2f}s]"
+                        )
+                else:
+                    log_scraper.info(
+                        f"Page {current_page}: {len(page_tenders)} tenders "
+                        f"(running total: {len(tenders_list)+len(page_tenders)}) [{page_time:.2f}s]"
+                    )
+
+                if known and all_known_streak >= early_stop_pages:
+                    log_scraper.warning(
+                        f"Early stop triggered — {early_stop_pages} consecutive pages of already-known tenders "
+                        f"(page {current_page}, total so far: {len(tenders_list)+len(page_tenders)})"
+                    )
+                    tenders_list.extend(page_tenders)
+                    if on_page and page_tenders:
+                        await on_page([t.to_dict() for t in page_tenders])
+                    run_summary.record("early_stop_triggered", True)
+                    break
+
+                # Checkpoint write — persist this page immediately before moving on
+                if on_page and page_tenders:
+                    try:
+                        await on_page([t.to_dict() for t in page_tenders])
+                    except Exception as cb_exc:
+                        log_scraper.warning(f"on_page callback failed (page {current_page}): {cb_exc} — continuing")
 
                 tenders_list.extend(page_tenders)
 
                 if current_page >= page_limit:
-                    log_step("Pagination", "success",
-                             {"status": f"Reached max_pages={page_limit}"})
+                    log_scraper.info(f"Reached max_pages limit ({page_limit})")
                     break
 
                 next_btn = await find_exact_next_button(page)
                 if not next_btn:
-                    log_step("Pagination", "success",
-                             {"status": "No more pages", "total": current_page})
+                    log_scraper.info(f"No more pages — pagination complete at page {current_page}")
                     break
 
                 await next_btn.click()
@@ -565,30 +632,31 @@ async def scrape_listing_pages(max_pages: Optional[int] = None) -> Dict:
             # STEP 5: Count live tenders
             total_live = await extract_live_tenders_count(page)
             if total_live:
-                log_step("Live Tenders Count", "success", {"count": total_live})
+                log_scraper.info(f"Portal reports {total_live:,} live tenders total")
 
             await browser.close()
 
-        log_step("Listing Scraper", "success", {
-            "total_tenders": len(tenders_list),
-            "total_pages":   current_page,
-            "live_tenders":  total_live or "N/A",
-        })
+        log_scraper.success(
+            f"Listing scrape complete — {len(tenders_list):,} tenders across {current_page} pages "
+            f"(live_count={total_live or 'N/A'}, early_stop={all_known_streak >= early_stop_pages})"
+        )
 
         return {
-            "success":      True,
-            "tenders":      [t.to_dict() for t in tenders_list],
-            "total_pages":  current_page,
-            "live_tenders": total_live,
+            "success":               True,
+            "tenders":               [t.to_dict() for t in tenders_list],
+            "total_pages":           current_page,
+            "live_tenders":          total_live,
+            "early_stop_triggered":  all_known_streak >= early_stop_pages,
         }
 
     except Exception as e:
-        log_step("Listing Scraper", "error", {"error": str(e)})
+        log_scraper.exception(f"Listing scraper crashed: {e}")
         return {
-            "success":     False,
-            "error":       str(e),
-            "tenders":     [t.to_dict() for t in tenders_list],
-            "total_pages": current_page,
+            "success":              False,
+            "error":                str(e),
+            "tenders":              [t.to_dict() for t in tenders_list],
+            "total_pages":          current_page,
+            "early_stop_triggered": False,
         }
 
 

@@ -32,10 +32,11 @@ import asyncio
 import os
 import time
 from collections import deque
-from typing import Dict, List, Optional
+from typing import AsyncIterator, Dict, List, Optional, Tuple
 
 import httpx
 
+from logger import log_cf, run_summary
 from scraper import parse_detail_page
 
 
@@ -281,8 +282,9 @@ def _cf_headers(api_token: str) -> Dict[str, str]:
 
 
 def _log(level: str, msg: str) -> None:
-    symbol = {"INFO": "🔵", "OK": "✅", "WARN": "⚠️", "ERR": "❌"}.get(level, "📌")
-    print(f"{symbol} [CF-Crawl] {msg}")
+    """Route legacy _log() calls through the structured logger."""
+    {"INFO": log_cf.info, "OK": log_cf.success,
+     "WARN": log_cf.warning, "ERR": log_cf.error}.get(level, log_cf.debug)(msg)
 
 
 # ── Core API calls ─────────────────────────────────────────────────────────────
@@ -313,8 +315,10 @@ async def submit_crawl(
     }
 
     await rate_limiter.acquire()
+    log_cf.debug(f"Submitting job for {url[:70]}")
 
     for attempt in range(MAX_RETRIES):
+        t0 = time.monotonic()
         try:
             resp = await client.post(
                 endpoint,
@@ -324,30 +328,32 @@ async def submit_crawl(
             )
         except (httpx.TimeoutException, httpx.NetworkError) as exc:
             delay = RETRY_BASE_DELAY * (2 ** attempt)
-            _log("WARN", f"submit network error (attempt {attempt+1}): {exc} — retrying in {delay:.1f}s")
+            log_cf.warning(f"Submit network error (attempt {attempt+1}/{MAX_RETRIES}): {exc} — retry in {delay:.1f}s")
             await asyncio.sleep(delay)
             continue
+
+        elapsed = time.monotonic() - t0
 
         if resp.status_code == 200:
             data   = resp.json()
             job_id = (data.get("result") or {}).get("id")
             if job_id:
-                _log("OK", f"job submitted → {job_id} for {url[:60]}")
+                log_cf.debug(f"Job submitted → {job_id} ({elapsed:.2f}s) for {url[:60]}")
                 return job_id
-            _log("WARN", f"submit 200 but no job_id in response: {data}")
+            log_cf.warning(f"Submit 200 but no job_id: {data}")
             return None
 
         if resp.status_code == 429 or resp.status_code >= 500:
             delay = RETRY_BASE_DELAY * (2 ** attempt)
-            _log("WARN", f"submit HTTP {resp.status_code} (attempt {attempt+1}) — retrying in {delay:.1f}s")
+            log_cf.warning(f"Submit HTTP {resp.status_code} (attempt {attempt+1}/{MAX_RETRIES}) — retry in {delay:.1f}s")
+            run_summary.increment("cf_rate_limited") if resp.status_code == 429 else None
             await asyncio.sleep(delay)
             continue
 
-        # 4xx (not 429): permanent failure, don't retry
-        _log("ERR", f"submit HTTP {resp.status_code} for {url[:60]}: {resp.text[:200]}")
+        log_cf.error(f"Submit HTTP {resp.status_code} (permanent) for {url[:60]}: {resp.text[:200]}")
         return None
 
-    _log("ERR", f"submit exhausted {MAX_RETRIES} retries for {url[:60]}")
+    log_cf.error(f"Submit exhausted {MAX_RETRIES} retries for {url[:60]}")
     return None
 
 
@@ -402,18 +408,19 @@ async def poll_job(
         status = result.get("status", "")
 
         if status in ("complete", "completed"):
-            _log("OK", f"job {job_id} complete")
+            log_cf.debug(f"Job {job_id} complete ({elapsed:.0f}s elapsed)")
             return result
 
         if status in ("failed", "error", "cancelled_due_to_timeout",
                       "cancelled_due_to_limits", "cancelled_by_user"):
-            _log("WARN", f"job {job_id} terminal status: {status}")
+            log_cf.warning(f"Job {job_id} terminal status: {status} ({elapsed:.0f}s)")
             return None
 
-        # Still running ("running", "pending", "processing") — keep polling
+        # Still running — keep polling
+        log_cf.debug(f"Job {job_id} status={status!r} ({elapsed:.0f}s elapsed) — next poll in {min(wait * POLL_BACKOFF_BASE, POLL_BACKOFF_CAP):.0f}s")
         wait = min(wait * POLL_BACKOFF_BASE, POLL_BACKOFF_CAP)
 
-    _log("WARN", f"job {job_id} timed out after {elapsed:.0f}s")
+    log_cf.warning(f"Job {job_id} timed out after {elapsed:.0f}s")
     return None
 
 
@@ -542,8 +549,6 @@ async def crawl_detail_pages(urls: List[str]) -> Dict[str, Dict]:
             *submit_tasks, return_exceptions=False
         )
 
-        # Map: job_id → url (for successful submissions)
-        # URLs with None job_id go directly to fallback
         job_to_url: Dict[str, str] = {}
         fallback_urls: List[str]   = []
 
@@ -553,7 +558,8 @@ async def crawl_detail_pages(urls: List[str]) -> Dict[str, Dict]:
             else:
                 fallback_urls.append(url)
 
-        _log("INFO", f"Submitted {len(job_to_url)} jobs, {len(fallback_urls)} direct-fallback")
+        run_summary.record("cf_jobs_submitted", len(job_to_url))
+        log_cf.info(f"Submission complete — {len(job_to_url)} jobs queued, {len(fallback_urls)} failed submission → direct fallback")
 
         # ── Step 2: Poll all jobs concurrently ───────────────────────────────
         poll_tasks = [
@@ -566,45 +572,170 @@ async def crawl_detail_pages(urls: List[str]) -> Dict[str, Dict]:
         output: Dict[str, Dict] = {}
         further_fallback: List[str] = list(fallback_urls)
 
+        cf_succeeded = 0
+        cf_failed    = 0
         for job_id, poll_result in zip(job_to_url.keys(), poll_results):
             url = job_to_url[job_id]
 
             if poll_result is None:
-                # Job failed or timed out
+                log_cf.warning(f"Job {job_id} returned no result — queuing for fallback")
                 further_fallback.append(url)
+                cf_failed += 1
                 continue
 
             fields = _extract_fields_from_job_result(poll_result, url)
             if fields:
                 output[url] = fields
-                _log("OK", f"CF extracted {len(fields)} fields for {url[:60]}")
+                log_cf.debug(f"CF extracted {len(fields)} fields — {url[:60]}")
+                cf_succeeded += 1
             else:
+                log_cf.debug(f"CF returned no fields — queuing fallback for {url[:60]}")
                 further_fallback.append(url)
+                cf_failed += 1
+
+        run_summary.record("cf_jobs_succeeded", cf_succeeded)
+        run_summary.record("cf_jobs_failed", cf_failed)
+        log_cf.info(f"Poll results — succeeded={cf_succeeded}, need_fallback={len(further_fallback)}")
 
         # ── Step 4: Direct httpx fallback for remaining URLs ─────────────────
         if further_fallback:
-            _log("INFO", f"Direct-fetch fallback for {len(further_fallback)} URLs")
+            log_cf.info(f"Direct-fetch fallback for {len(further_fallback)} URLs...")
+            run_summary.record("cf_fallback_used", len(further_fallback))
             fallback_tasks = [
                 _fallback_selectolax(u, client) for u in further_fallback
             ]
             fallback_results = await asyncio.gather(
                 *fallback_tasks, return_exceptions=False
             )
+            fallback_ok = 0
             for url, fields in zip(further_fallback, fallback_results):
                 if isinstance(fields, dict) and fields:
                     output[url] = fields
-                    _log("OK", f"Fallback extracted {len(fields)} fields for {url[:60]}")
+                    fallback_ok += 1
+                    log_cf.debug(f"Fallback extracted {len(fields)} fields — {url[:60]}")
                 else:
                     output[url] = {}
-                    _log("WARN", f"No fields extractable for {url[:60]}")
+                    log_cf.warning(f"No fields extractable (CF + fallback both failed) — {url[:60]}")
+            log_cf.info(f"Fallback complete — {fallback_ok}/{len(further_fallback)} recovered")
 
         # Ensure every input URL has an entry
         for url in urls:
             if url not in output:
                 output[url] = {}
 
-    _log("INFO", f"CF phase complete: {sum(1 for v in output.values() if v)}/{len(urls)} URLs had extractable data")
+    total_with_data = sum(1 for v in output.values() if v)
+    log_cf.success(f"CF phase complete — {total_with_data}/{len(urls)} URLs had extractable data")
     return output
+
+
+# ── Streaming detail page crawler ─────────────────────────────────────────────
+
+async def _poll_with_id(
+    job_id: str,
+    client: httpx.AsyncClient,
+    account_id: str,
+    api_token: str,
+) -> Tuple[str, Optional[Dict]]:
+    """Wrap poll_job to carry job_id through asyncio.as_completed()."""
+    result = await poll_job(job_id, client, account_id, api_token)
+    return job_id, result
+
+
+async def crawl_detail_pages_stream(
+    url_to_ref: Dict[str, str],
+) -> AsyncIterator[Tuple[str, str, Dict]]:
+    """
+    Streaming version of crawl_detail_pages.
+
+    Submits all detail URLs as Cloudflare jobs (rate-limited), then yields
+    (url, ref_no, fields) as each individual job completes — using
+    asyncio.as_completed() instead of asyncio.gather().
+
+    This means callers can write each result to Supabase immediately as it
+    arrives, rather than buffering everything in memory until the last job
+    finishes. A process crash after 40 of 50 jobs still saves 40 tenders.
+
+    Args:
+        url_to_ref: Dict mapping detail page URL → stable ref_no.
+                    Using ref_no (not URL) as the Supabase update key avoids
+                    relying on volatile sp= session token URLs.
+
+    Yields:
+        (url, ref_no, fields) — fields is {} if extraction failed entirely.
+    """
+    if not url_to_ref:
+        return
+
+    urls       = list(url_to_ref.keys())
+    account_id = os.getenv("CLOUDFLARE_ACCOUNT_ID", "")
+    api_token  = os.getenv("CLOUDFLARE_API_TOKEN", "")
+
+    if not account_id or not api_token:
+        log_cf.warning("CF credentials missing — streaming fallback via direct httpx")
+        async with httpx.AsyncClient() as client:
+            for url in urls:
+                fields = await _fallback_selectolax(url, client)
+                yield url, url_to_ref[url], fields or {}
+        return
+
+    rate_limiter = RateLimiter(
+        max_calls=MAX_SUBMISSIONS_PER_MINUTE,
+        window_seconds=RATE_WINDOW_SECS,
+    )
+
+    async with httpx.AsyncClient() as client:
+        # ── Submit all jobs (rate-limited) ───────────────────────────────────
+        submit_tasks = [
+            submit_crawl(url, client, account_id, api_token, rate_limiter)
+            for url in urls
+        ]
+        job_ids: List[Optional[str]] = await asyncio.gather(*submit_tasks)
+
+        job_to_url: Dict[str, str] = {}
+        fallback_urls: List[str]   = []
+        for url, job_id in zip(urls, job_ids):
+            if job_id:
+                job_to_url[job_id] = url
+            else:
+                fallback_urls.append(url)
+
+        log_cf.info(
+            f"Stream: {len(job_to_url)} jobs submitted, "
+            f"{len(fallback_urls)} direct-fallback, "
+            f"yielding results as each completes..."
+        )
+
+        # ── Poll concurrently, yield as each finishes ────────────────────────
+        poll_tasks = [
+            _poll_with_id(job_id, client, account_id, api_token)
+            for job_id in job_to_url
+        ]
+
+        for coro in asyncio.as_completed(poll_tasks):
+            job_id, poll_result = await coro
+            url    = job_to_url[job_id]
+            ref_no = url_to_ref[url]
+
+            if poll_result is None:
+                log_cf.warning(f"Stream: job {job_id} failed — falling back for {url[:60]}")
+                fields = await _fallback_selectolax(url, client)
+                yield url, ref_no, fields or {}
+                continue
+
+            fields = _extract_fields_from_job_result(poll_result, url)
+            if fields:
+                log_cf.debug(f"Stream: yielding {len(fields)} fields for {ref_no}")
+                yield url, ref_no, fields
+            else:
+                log_cf.debug(f"Stream: no CF fields for {url[:60]} — falling back")
+                fields = await _fallback_selectolax(url, client)
+                yield url, ref_no, fields or {}
+
+        # ── Direct fallback for submission-failed URLs ────────────────────────
+        for url in fallback_urls:
+            ref_no = url_to_ref[url]
+            fields = await _fallback_selectolax(url, client)
+            yield url, ref_no, fields or {}
 
 
 # ── CPPP listing crawler ───────────────────────────────────────────────────────

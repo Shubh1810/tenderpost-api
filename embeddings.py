@@ -12,10 +12,13 @@ Cost:  ~$0.02 per 1M tokens — 2248 tenders ≈ $0.001 total
 """
 
 import os
+import time
 from typing import Optional
 
 import httpx
 from dotenv import load_dotenv
+
+from logger import log_embed
 
 load_dotenv()
 
@@ -148,8 +151,13 @@ async def get_embedding(text: str) -> list[float]:
         raise ValueError("OPENAI_API_KEY not set in .env")
 
     # Truncate to safe length — OpenAI limit is 8191 tokens
-    # ~4 chars per token, so 30000 chars is safely under limit
+    original_len = len(text)
     text = text[:30000]
+    if len(text) < original_len:
+        log_embed.debug(f"Text truncated from {original_len} to 30000 chars")
+
+    log_embed.debug(f"Calling OpenAI embeddings — model={EMBEDDING_MODEL}, text_len={len(text)} chars")
+    t0 = time.perf_counter()
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.post(
@@ -166,6 +174,14 @@ async def get_embedding(text: str) -> list[float]:
         response.raise_for_status()
         data = response.json()
 
+    elapsed = time.perf_counter() - t0
+    usage   = data.get("usage", {})
+    log_embed.debug(
+        f"OpenAI response — {elapsed:.2f}s | "
+        f"prompt_tokens={usage.get('prompt_tokens', '?')} | "
+        f"total_tokens={usage.get('total_tokens', '?')}"
+    )
+
     try:
         return data["data"][0]["embedding"]
     except (KeyError, IndexError) as e:
@@ -180,13 +196,16 @@ async def embed_tender(tender: dict) -> Optional[list[float]]:
 
     Returns None on failure so the cron job can skip and continue.
     """
+    ref_no = tender.get("ref_no", "unknown")[:40]
     try:
-        text = build_tender_text(tender)
+        text      = build_tender_text(tender)
+        field_cnt = text.count(". ") + 1
+        log_embed.debug(f"Embedding tender {ref_no} — {field_cnt} fields, {len(text)} chars | preview: {text[:80]!r}")
         embedding = await get_embedding(text)
-        print(f"  ✅ Embedded tender: {tender.get('ref_no', 'unknown')[:40]}")
+        log_embed.debug(f"Tender embedded OK — {ref_no} ({len(embedding)} dims)")
         return embedding
     except Exception as e:
-        print(f"  ⚠️  Failed to embed tender {tender.get('id')}: {e}")
+        log_embed.error(f"Failed to embed tender {ref_no} (id={tender.get('id')}): {e}")
         return None
 
 
@@ -196,11 +215,13 @@ async def embed_user_preferences(preferences: dict) -> Optional[list[float]]:
 
     Returns None on failure.
     """
+    user_id = preferences.get("user_id", "unknown")
     try:
         text = build_user_preference_text(preferences)
+        log_embed.debug(f"Embedding preferences for user {user_id} — {len(text)} chars | preview: {text[:80]!r}")
         embedding = await get_embedding(text)
-        print(f"  ✅ Embedded preferences for user: {preferences.get('user_id', 'unknown')}")
+        log_embed.debug(f"Preferences embedded OK — user {user_id} ({len(embedding)} dims)")
         return embedding
     except Exception as e:
-        print(f"  ⚠️  Failed to embed user preferences: {e}")
+        log_embed.error(f"Failed to embed preferences for user {user_id}: {e}")
         return None

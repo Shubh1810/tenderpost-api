@@ -1,93 +1,104 @@
 #!/bin/bash
-
-# TenderPost Scraper - Debug Mode Runner
-# This script builds and runs the Docker container with debugging enabled
+# TenderPost — Debug Runner
+# Builds Docker image and starts two services:
+#   • cppp-scraper   — scrapes all active tenders, pushes to Supabase, then exits
+#   • tenderpost-api — FastAPI server on localhost:8000 (with hot-reload)
+#
+# Usage:
+#   ./run-debug.sh                    # run both services (scraper + API)
+#   ./run-debug.sh scraper-only       # run only the CPPP scraper
+#   ./run-debug.sh api-only           # run only the FastAPI server
 
 set -e
 
-# Enable Docker BuildKit for better caching
+DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$DIR"
+
+# Enable BuildKit
 export DOCKER_BUILDKIT=1
 export COMPOSE_DOCKER_CLI_BUILD=1
 
-echo "🐛 TenderPost Backend - Debug Mode"
-echo "===================================="
+echo ""
+echo "=================================="
+echo "  TenderPost — Debug Mode"
+echo "=================================="
 echo ""
 
-# Check if .env exists
-if [ ! -f .env ]; then
-    echo "⚠️  .env file not found!"
-    echo "📝 Creating .env from template..."
-    
-    if [ -f .env.template ]; then
-        cp .env.template .env
-        echo "✅ .env file created"
-        echo ""
-        echo "⚠️  IMPORTANT: You must add your 2Captcha API key to .env"
-        echo "   Edit the file: nano .env"
-        echo "   Add: TWOCAPTCHA_API_KEY=your_api_key_here"
-        echo ""
-        read -p "Press Enter after updating .env, or Ctrl+C to exit..."
-    else
-        echo "❌ .env.template not found!"
-        exit 1
-    fi
+# ── Load env vars from both .env files ─────────────────────────────────────────
+# Load cppp_scraper/.env first (has SUPABASE_KEY)
+if [ -f "$DIR/cppp_scraper/.env" ]; then
+    set -a; source "$DIR/cppp_scraper/.env"; set +a
+fi
+# Load root .env (may have TWOCAPTCHA_API_KEY, SUPABASE_SERVICE_ROLE_KEY, etc.)
+if [ -f "$DIR/.env" ]; then
+    set -a; source "$DIR/.env"; set +a
 fi
 
-# Check if 2Captcha API key is set
-source .env
-if [ -z "$TWOCAPTCHA_API_KEY" ] || [ "$TWOCAPTCHA_API_KEY" = "your_2captcha_api_key_here" ]; then
-    echo "❌ ERROR: TWOCAPTCHA_API_KEY not set in .env file!"
-    echo ""
-    echo "Please edit .env and add your 2Captcha API key:"
-    echo "   TWOCAPTCHA_API_KEY=your_actual_api_key"
-    echo ""
-    echo "Get your API key from: https://2captcha.com/"
+# Normalise: SUPABASE_SERVICE_ROLE_KEY and SUPABASE_KEY are the same credential
+if [ -n "$SUPABASE_KEY" ] && [ -z "$SUPABASE_SERVICE_ROLE_KEY" ]; then
+    export SUPABASE_SERVICE_ROLE_KEY="$SUPABASE_KEY"
+fi
+if [ -n "$SUPABASE_SERVICE_ROLE_KEY" ] && [ -z "$SUPABASE_KEY" ]; then
+    export SUPABASE_KEY="$SUPABASE_SERVICE_ROLE_KEY"
+fi
+
+# ── Check Supabase credentials (required for the scraper) ─────────────────────
+if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_KEY" ]; then
+    echo "ERROR: SUPABASE_URL and SUPABASE_KEY must be set."
+    echo "       Add them to cppp_scraper/.env and re-run."
     exit 1
 fi
+echo "  Supabase URL : $SUPABASE_URL"
+echo "  Supabase Key : ${SUPABASE_KEY:0:20}..."
 
-echo "✅ 2Captcha API key detected: ${TWOCAPTCHA_API_KEY:0:8}..."
-
-if [ -z "$CLOUDFLARE_API_TOKEN" ] || [ "$CLOUDFLARE_API_TOKEN" = "<your_cf_api_token>" ]; then
-    echo "⚠️  WARNING: CLOUDFLARE_API_TOKEN not set — Cloudflare crawl will be skipped"
-    echo "   Set CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID in .env to enable"
+# ── Optional credentials (warn but don't block) ────────────────────────────────
+if [ -z "$TWOCAPTCHA_API_KEY" ]; then
+    echo "  2Captcha     : not set (old eprocure scraper disabled — OK)"
 else
-    echo "✅ Cloudflare API token detected: ${CLOUDFLARE_API_TOKEN:0:8}..."
+    echo "  2Captcha     : ${TWOCAPTCHA_API_KEY:0:8}..."
 fi
 echo ""
 
-# Stop any existing containers
-echo "🛑 Stopping existing containers..."
+# ── Stop any existing containers ───────────────────────────────────────────────
+echo "Stopping existing containers..."
 docker-compose -f docker-compose.dev.yml down 2>/dev/null || true
 echo ""
 
-# Build the image
-echo "🔨 Building Docker image..."
-echo "   ℹ️  BuildKit enabled for faster builds with better caching"
-echo "   ℹ️  Chromium browser will be cached (no re-download on code changes)"
-echo ""
+# ── Build ──────────────────────────────────────────────────────────────────────
+echo "Building Docker image..."
 docker-compose -f docker-compose.dev.yml build --progress=plain
 echo ""
 
-# Run the container
-echo "🚀 Starting container in DEBUG mode..."
-echo ""
-echo "📊 Debug Configuration:"
-echo "   • Debug Mode: ENABLED"
-echo "   • Max Pages: 5 (for testing)"
-echo "   • Log Level: DEBUG"
-echo "   • Auto-reload: ENABLED"
-echo ""
-echo "🌐 API will be available at: http://localhost:8000"
-echo "📚 API Documentation: http://localhost:8000/docs"
-echo ""
-echo "📝 Useful commands while running:"
-echo "   • View logs: docker logs -f tenderpost-scraper-dev"
-echo "   • Stop: docker-compose -f docker-compose.dev.yml down"
-echo "   • Restart: docker-compose -f docker-compose.dev.yml restart"
-echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo ""
+# ── Start ──────────────────────────────────────────────────────────────────────
+MODE="${1:-both}"
 
-# Run with logs attached
-docker-compose -f docker-compose.dev.yml up
-
+case "$MODE" in
+  scraper-only)
+    echo "Starting CPPP scraper only..."
+    echo "  → Scraping eprocure.gov.in/cppp/latestactivetendersnew/mmpdata"
+    echo "  → Pushing to Supabase tenders table (source=cppp)"
+    echo ""
+    docker-compose -f docker-compose.dev.yml run --rm cppp-scraper
+    ;;
+  api-only)
+    echo "Starting FastAPI server only..."
+    echo "  → http://localhost:8000"
+    echo "  → Docs: http://localhost:8000/docs"
+    echo ""
+    docker-compose -f docker-compose.dev.yml up tenderpost-scraper-dev
+    ;;
+  *)
+    echo "Starting all services (watch mode):"
+    echo "  cppp-scraper   — scrapes tenders → Supabase"
+    echo "  tenderpost-api — FastAPI on http://localhost:8000"
+    echo ""
+    echo "  Code changes sync instantly into containers (no rebuild)."
+    echo "  pyproject.toml changes trigger an automatic rebuild."
+    echo ""
+    echo "Logs:"
+    echo "  docker logs -f tenderpost-cppp-scraper"
+    echo "  docker logs -f tenderpost-scraper-dev"
+    echo ""
+    docker compose -f docker-compose.dev.yml up --watch
+    ;;
+esac
