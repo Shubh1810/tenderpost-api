@@ -5,26 +5,14 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      args:
-        BUILDKIT_INLINE_CACHE: 1
     container_name: tenderpost-scraper-dev
     ports:
       - "8000:8000"
     environment:
-      - TWOCAPTCHA_API_KEY=${TWOCAPTCHA_API_KEY:-}
       - SUPABASE_URL=${SUPABASE_URL:-}
       - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY:-}
-      - SUPABASE_KEY=${SUPABASE_KEY:-}
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN:-}
-      - CLOUDFLARE_ACCOUNT_ID=${CLOUDFLARE_ACCOUNT_ID:-}
-      - USE_CLOUDFLARE=${USE_CLOUDFLARE:-true}
-      - SCRAPE_CPPP=${SCRAPE_CPPP:-true}
-      - SOLVE_CAPTCHA=${SOLVE_CAPTCHA:-false}
-      - DEBUG=true
       - LOG_LEVEL=DEBUG
-      - MAX_PAGES=200
-      - PAGE_TIMEOUT=30000
+      - LOG_FORMAT=pretty
       - ENVIRONMENT=development
     volumes:
       - ./logs:/app/logs
@@ -33,13 +21,12 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '2'
-          memory: 2G
+          cpus: '1'
+          memory: 512M
     tty: true
     stdin_open: true
     develop:
       watch:
-        # Sync Python source changes instantly — no rebuild needed
         - action: sync
           path: ./main.py
           target: /app/main.py
@@ -53,18 +40,8 @@ services:
           path: ./supabase_client.py
           target: /app/supabase_client.py
         - action: sync
-          path: ./embeddings.py
-          target: /app/embeddings.py
-        - action: sync
-          path: ./cloudflare_crawl.py
-          target: /app/cloudflare_crawl.py
-        - action: sync
           path: ./logger.py
           target: /app/logger.py
-        - action: sync
-          path: ./run_embed.py
-          target: /app/run_embed.py
-        # Rebuild only when dependencies change
         - action: rebuild
           path: pyproject.toml
 
@@ -72,51 +49,35 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      args:
-        BUILDKIT_INLINE_CACHE: 1
     container_name: tenderpost-cppp-scraper
     environment:
       - SUPABASE_URL=${SUPABASE_URL:-}
       - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY:-}
-      - SUPABASE_KEY=${SUPABASE_KEY:-}
+      - LOG_LEVEL=DEBUG
+      - LOG_FORMAT=pretty
       - ENVIRONMENT=development
     volumes:
       - ./logs:/app/logs
-      - cppp-db:/app/cppp_scraper/data
     restart: "no"
-    command: ["python", "cppp_scraper/run.py"]
+    command: ["python", "run_cron.py"]
     deploy:
       resources:
         limits:
           cpus: '1'
-          memory: 512M
+          memory: 256M
     develop:
       watch:
-        # Any change to scraper code syncs instantly into the running container
         - action: sync
-          path: ./cppp_scraper/config.py
-          target: /app/cppp_scraper/config.py
+          path: ./scraper.py
+          target: /app/scraper.py
         - action: sync
-          path: ./cppp_scraper/db.py
-          target: /app/cppp_scraper/db.py
+          path: ./run_cron.py
+          target: /app/run_cron.py
         - action: sync
-          path: ./cppp_scraper/scraper.py
-          target: /app/cppp_scraper/scraper.py
+          path: ./logger.py
+          target: /app/logger.py
         - action: sync
-          path: ./cppp_scraper/pipeline.py
-          target: /app/cppp_scraper/pipeline.py
-        - action: sync
-          path: ./cppp_scraper/supabase_sync.py
-          target: /app/cppp_scraper/supabase_sync.py
-        - action: sync
-          path: ./cppp_scraper/export.py
-          target: /app/cppp_scraper/export.py
-        - action: sync
-          path: ./cppp_scraper/run.py
-          target: /app/cppp_scraper/run.py
-        # Rebuild if new packages are added
+          path: ./supabase_client.py
+          target: /app/supabase_client.py
         - action: rebuild
           path: pyproject.toml
-
-volumes:
-  cppp-db:

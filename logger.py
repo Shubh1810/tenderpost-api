@@ -2,18 +2,16 @@
 logger.py — Centralized structured logging for TenderPost scraper.
 
 Usage:
-    from logger import log, timer, run_summary
+    from logger import log, log_scraper, log_supabase, timer, run_summary
 
     log.info("Starting scrape")
-    log.success("Upserted 42 tenders")
-    log.warning("CAPTCHA solve took too long")
-    log.error("Cloudflare job failed", job_id=job_id, url=url)
+    log_scraper.success("Scraped 42 tenders")
+    log_supabase.warning("Upsert batch failed")
 
-    with timer("cloudflare_detail_fetch"):
-        ...  # automatically logs start + end with elapsed time
+    with timer("listing_central", stage="SCRAPER"):
+        ...  # logs start + elapsed time automatically
 
-    run_summary.record("tenders_scraped", 150)
-    run_summary.record("cf_jobs_submitted", 30)
+    run_summary.record("listing_tenders_central", 150)
     run_summary.print()
 """
 
@@ -84,11 +82,7 @@ def get_logger(stage: str):
 
 log          = get_logger("PIPELINE")
 log_scraper  = get_logger("SCRAPER")
-log_cf       = get_logger("CLOUDFLARE")
-log_embed    = get_logger("EMBEDDINGS")
 log_supabase = get_logger("SUPABASE")
-log_cppp     = get_logger("CPPP")
-log_captcha  = get_logger("CAPTCHA")
 
 
 # ── Timing context manager ─────────────────────────────────────────────────────
@@ -142,43 +136,37 @@ class RunSummary:
         elapsed = self.elapsed()
         sep = "=" * 58
         log.info(sep)
-        log.info("  TENDERPOST — RUN COMPLETE")
+        log.info("  TENDERPOST — CPPP PIPELINE COMPLETE")
         log.info(sep)
         log.info(f"  Total run time       : {elapsed:.1f}s  ({elapsed/60:.1f} min)")
 
         sections: Dict[str, list] = {
             "DB State (pre-run)": [],
             "Scrape": [],
-            "Cloudflare": [],
+            "Detail": [],
             "Upsert": [],
-            "Embeddings": [],
             "Other": [],
         }
 
         key_map = {
-            "known_already_detailed":   ("DB State (pre-run)", "Already detailed in DB"),
-            "known_exists_no_detail":   ("DB State (pre-run)", "Exists, no detail in DB"),
-            "listing_pages_scraped":    ("Scrape",             "Listing pages scraped"),
-            "listing_tenders_found":    ("Scrape",             "Tenders found on listing"),
-            "early_stop_triggered":     ("Scrape",             "Early stop triggered"),
-            "captcha_solved":           ("Scrape",             "CAPTCHA solved"),
-            "captcha_time_s":           ("Scrape",             "CAPTCHA solve time (s)"),
-            "cf_jobs_submitted":        ("Cloudflare",         "Jobs submitted"),
-            "cf_jobs_skipped":          ("Cloudflare",         "Jobs skipped (already complete)"),
-            "cf_jobs_succeeded":        ("Cloudflare",         "Jobs succeeded"),
-            "cf_jobs_failed":           ("Cloudflare",         "Jobs failed"),
-            "cf_fallback_used":         ("Cloudflare",         "Fallback (direct httpx) used"),
-            "cf_fields_extracted":      ("Cloudflare",         "Tenders with detail fields"),
-            "upsert_full":              ("Upsert",             "Full upsert (new/undetailed)"),
-            "upsert_listing_only":      ("Upsert",             "Listing-only upsert (complete)"),
-            "upsert_total":             ("Upsert",             "Total rows upserted"),
-            "marked_inactive":          ("Upsert",             "Marked inactive"),
-            "embed_attempted":          ("Embeddings",         "Attempted"),
-            "embed_succeeded":          ("Embeddings",         "Succeeded"),
-            "embed_failed":             ("Embeddings",         "Failed"),
-            "embed_skipped_no_fields":  ("Embeddings",         "Skipped (no embeddable fields)"),
-            "embed_total_time_s":       ("Embeddings",         "Total time (s)"),
-            "embed_avg_time_s":         ("Embeddings",         "Avg per tender (s)"),
+            "known_central_detailed":    ("DB State (pre-run)", "Central — already detailed"),
+            "known_central_no_detail":   ("DB State (pre-run)", "Central — exists, no detail"),
+            "known_state_detailed":      ("DB State (pre-run)", "State — already detailed"),
+            "known_state_no_detail":     ("DB State (pre-run)", "State — exists, no detail"),
+            "listing_tenders_central":   ("Scrape",  "Central tenders scraped"),
+            "listing_pages_central":     ("Scrape",  "Central pages scraped"),
+            "listing_tenders_state":     ("Scrape",  "State tenders scraped"),
+            "listing_pages_state":       ("Scrape",  "State pages scraped"),
+            "early_stop_central":        ("Scrape",  "Central early stop triggered"),
+            "early_stop_state":          ("Scrape",  "State early stop triggered"),
+            "detail_pages_fetched":      ("Detail",  "Detail pages fetched"),
+            "detail_pages_with_data":    ("Detail",  "Detail pages with data"),
+            "detail_written":            ("Detail",  "Written to Supabase"),
+            "detail_no_fields":          ("Detail",  "No fields extracted"),
+            "upsert_full":               ("Upsert",  "Full upsert (new/undetailed)"),
+            "upsert_listing_only":       ("Upsert",  "Listing-only upsert (complete)"),
+            "upsert_total":              ("Upsert",  "Total rows upserted"),
+            "marked_inactive":           ("Upsert",  "Marked inactive"),
         }
 
         for key, value in self._metrics.items():

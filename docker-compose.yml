@@ -5,20 +5,14 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      # Enable BuildKit for better caching
-      args:
-        BUILDKIT_INLINE_CACHE: 1
     container_name: tenderpost-scraper
     ports:
       - "8000:8000"
     environment:
-      - TWOCAPTCHA_API_KEY=${TWOCAPTCHA_API_KEY}
       - SUPABASE_URL=${SUPABASE_URL:-}
       - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY:-}
-      - DEBUG=${DEBUG:-false}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - MAX_PAGES=${MAX_PAGES:-200}
-      - PAGE_TIMEOUT=${PAGE_TIMEOUT:-30000}
+      - LOG_FORMAT=${LOG_FORMAT:-pretty}
       - ENVIRONMENT=production
     volumes:
       - ./logs:/app/logs
@@ -28,20 +22,17 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 40s
-    # Resource limits
+      start_period: 20s
     deploy:
       resources:
         limits:
-          cpus: '2'
-          memory: 2G
-        reservations:
           cpus: '1'
           memory: 512M
-    # Logging
+        reservations:
+          cpus: '0.25'
+          memory: 128M
     logging:
       driver: "json-file"
       options:
         max-size: "10m"
         max-file: "3"
-

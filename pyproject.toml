@@ -1,7 +1,7 @@
 [tool.poetry]
 name = "tenderpost-backend"
-version = "1.0.0"
-description = "Hybrid tender scraper: Playwright (CAPTCHA listing) + Cloudflare /crawl (bulk extraction)"
+version = "2.0.0"
+description = "CPPP tender scraper — httpx + selectolax, no browser required"
 authors = ["TenderPost Team"]
 readme = "README.md"
 
@@ -9,23 +9,16 @@ readme = "README.md"
 python = "^3.9"
 fastapi = "^0.104.1"
 uvicorn = {extras = ["standard"], version = "^0.24.0"}
-playwright = "^1.40.0"
 httpx = {extras = ["asyncio"], version = "^0.27.2"}
 pydantic = "^2.5.0"
 pydantic-settings = "^2.1.0"
-pillow = "^10.1.0"
 selectolax = "^0.3.17"
+lxml = "^5.0.0"
 python-dotenv = "^1.0.0"
 supabase = "2.24.0"
-# ── cppp_scraper dependencies ──────────────────────────────────────────────
-hishel = "^0.0.30"
-beautifulsoup4 = "^4.12.0"
-lxml = "^5.0.0"
-aiosqlite = "^0.20.0"
 tenacity = "^8.2.0"
-tqdm = "^4.66.0"
 loguru = "^0.7.0"
-pandas = "^2.0.0"
+tqdm = "^4.66.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.4.3"
@@ -46,4 +39,3 @@ python_version = "3.9"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
-

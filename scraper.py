@@ -1,332 +1,66 @@
 """
-scraper.py — Playwright listing scraper + Selectolax detail page parser.
+scraper.py — httpx + selectolax listing and detail page scraper.
 
-Architecture (hybrid pipeline):
-- Phase 1 (this file): Playwright handles CAPTCHA-protected listing pages only.
-  Collects title, ref_no, dates, organisation, detail_url per tender.
-  Does NOT click into detail pages.
-- Phase 2 (cloudflare_crawl.py): Cloudflare /crawl handles detail page extraction
-  in bulk using AI, with this file's parse_detail_page() as the Selectolax fallback.
+Sources:
+  Central: https://eprocure.gov.in/cppp/latestactivetendersnew/cpppdata
+  State:   https://eprocure.gov.in/cppp/latestactivetendersnew/mmpdata
 
-Key HTML facts for eprocure.gov.in:
-- Detail page: all data lives in <table class="tablebg"> — NOT in the nav sidebar.
-  The left sidebar also contains <script> tags and nav links — scoping to
-  tablebg avoids all contamination.
-- Labels: <td class="td_caption">, values: <td class="td_field">
-- Multiple label+value pairs share a single <tr>:
-    <tr>
-      <td class="td_caption">Tender Value in ₹</td><td class="td_field">3,86,15,626</td>
-      <td class="td_caption">Product Category</td><td class="td_field">Electrical Works</td>
-      <td class="td_caption">Sub category</td><td class="td_field">NA</td>
-    </tr>
-- List page tender links: id="DirectLink_0", "DirectLink_0_0" etc.
-  with href containing sp= session token unique per tender.
-  WARNING: sp= tokens may expire — Phase 2 must run immediately after Phase 1.
+Detail pages:
+  Central: https://eprocure.gov.in/cppp/tendersfullview/[token]
+  State:   https://eprocure.gov.in/cppp/tendersfullviewmmp/[token]
+
+Pagination: ?page=N (10 records/page, 0-indexed).
+No CAPTCHA, no browser, no cloud rendering — all data is in page source.
+Detail URL tokens are session-bound; fetch using the same AsyncClient that
+loaded the listing so session cookies are preserved automatically.
 """
 
 import asyncio
-import os
+import base64
 import re
-import time
-from typing import Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
-from playwright.async_api import Page, async_playwright
+import httpx
 from selectolax.parser import HTMLParser
 
-from captcha.screenshot import capture_captcha_screenshot, detect_captcha_presence
-from captcha.solver import solve_captcha_2captcha
-from logger import log_captcha, log_scraper, run_summary
+from logger import log_scraper, run_summary
+
+# ── URLs ──────────────────────────────────────────────────────────────────────
+
+CENTRAL_LISTING_URL = "https://eprocure.gov.in/cppp/latestactivetendersnew/cpppdata"
+STATE_LISTING_URL   = "https://eprocure.gov.in/cppp/latestactivetendersnew/mmpdata"
+CPPP_BASE_URL       = "https://eprocure.gov.in"
+
+SOURCES = {
+    "central": CENTRAL_LISTING_URL,
+    "state":   STATE_LISTING_URL,
+}
+
+# ── HTTP config ───────────────────────────────────────────────────────────────
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+}
+
+LISTING_PAGE_CONCURRENCY = 10   # concurrent listing page fetches (don't hammer gov server)
+DETAIL_CONCURRENCY       = 20   # concurrent detail page fetches
+REQUEST_TIMEOUT          = 25.0
+REQUEST_RETRIES          = 3    # per-page retries before giving up
 
 
-# ── Target URLs ───────────────────────────────────────────────────────────────
-ADVANCED_SEARCH_URL = "https://eprocure.gov.in/eprocure/app?page=FrontEndAdvancedSearch&service=page"
-LATEST_TENDERS_URL  = "https://eprocure.gov.in/eprocure/app?page=FrontEndLatestActiveTenders&service=page"
-
-# ── Form selectors (unchanged) ────────────────────────────────────────────────
-TENDER_TYPE_SELECTORS = [
-    'select[name="TenderType"]',
-    'select[name="tenderType"]',
-    'select[id*="TenderType"]',
-    'select:has(option[value="1"])',
-]
-CAPTCHA_INPUT_SELECTOR = 'input[name="captchaText"]'
-SUBMIT_BUTTON_SELECTOR = 'input[type="submit"][value="Search"]'
-RESULTS_TABLE_SELECTOR = "table.list tbody tr"
-
-# ── Limits ────────────────────────────────────────────────────────────────────
-MAX_PAGES     = int(os.getenv("MAX_PAGES", "200"))
-PAGE_TIMEOUT  = int(os.getenv("PAGE_TIMEOUT", "30000"))
-SOLVE_CAPTCHA = os.getenv("SOLVE_CAPTCHA", "true").lower() == "true"
-
-
-# ── Logging ───────────────────────────────────────────────────────────────────
-
-def log_step(step: str, status: str, details: Dict) -> None:
-    emoji = {"success": "✅", "error": "❌", "warning": "⚠️",
-             "initiated": "🔵", "processing": "⏳"}.get(status, "📌")
-    print(f"{emoji} [{step}] {status.upper()}")
-    for k, v in details.items():
-        print(f"   • {k}: {v}")
-
-
-# ── Data model ────────────────────────────────────────────────────────────────
-
-class TenderItem:
-    """
-    Holds both list-page fields AND detail-page fields in one object.
-    Detail fields default to None — populated when SCRAPE_DETAILS=true.
-    """
-
-    def __init__(
-        self,
-        title: str,
-        ref_no: Optional[str]                     = None,
-        closing_date: Optional[str]               = None,
-        opening_date: Optional[str]               = None,
-        published_date: Optional[str]             = None,
-        organisation: Optional[str]               = None,
-        url: Optional[str]                        = None,
-        # ── detail-page fields ──
-        tender_id: Optional[str]                  = None,
-        tender_type: Optional[str]                = None,
-        tender_category: Optional[str]            = None,
-        contract_type: Optional[str]              = None,
-        work_description: Optional[str]           = None,
-        product_category: Optional[str]           = None,
-        sub_category: Optional[str]               = None,
-        location: Optional[str]                   = None,
-        pincode: Optional[str]                    = None,
-        tender_value: Optional[float]             = None,
-        emd_amount: Optional[float]               = None,
-        period_of_work_days: Optional[int]        = None,
-        bid_validity_days: Optional[int]          = None,
-        pre_bid_meeting_date: Optional[str]       = None,
-        inviting_authority_name: Optional[str]    = None,
-        inviting_authority_address: Optional[str] = None,
-    ):
-        self.title                      = title
-        self.ref_no                     = ref_no
-        self.closing_date               = closing_date
-        self.opening_date               = opening_date
-        self.published_date             = published_date
-        self.organisation               = organisation
-        self.url                        = url
-        self.tender_id                  = tender_id
-        self.tender_type                = tender_type
-        self.tender_category            = tender_category
-        self.contract_type              = contract_type
-        self.work_description           = work_description
-        self.product_category           = product_category
-        self.sub_category               = sub_category
-        self.location                   = location
-        self.pincode                    = pincode
-        self.tender_value               = tender_value
-        self.emd_amount                 = emd_amount
-        self.period_of_work_days        = period_of_work_days
-        self.bid_validity_days          = bid_validity_days
-        self.pre_bid_meeting_date       = pre_bid_meeting_date
-        self.inviting_authority_name    = inviting_authority_name
-        self.inviting_authority_address = inviting_authority_address
-
-    def to_dict(self) -> Dict:
-        return {k: v for k, v in self.__dict__.items()}
-
-
-# ── Unchanged helpers ─────────────────────────────────────────────────────────
-
-def parse_title_and_ref(title_and_ref: str) -> Tuple[str, str]:
-    parts = title_and_ref.split("]")
-    if len(parts) >= 3:
-        title  = parts[0].lstrip("[").strip()
-        ref_no = parts[1].lstrip("[").strip()
-        return title, ref_no
-    return title_and_ref.strip(), ""
-
-
-def is_valid_tender(title, closing_date, opening_date, published_date, organisation) -> bool:
-    header_patterns = [
-        "search", "|", "eprocurement system", "s.no", "serial",
-        "government of india", "tender id", "ref.no", "organisation chain",
-        "closing date", "opening date", "published date", "e-published date",
-        "bid closing", "bid opening",
-    ]
-    title_lower = title.lower()
-    if any(p in title_lower for p in header_patterns):
-        return False
-    if closing_date.lower()   in ["closing date", "close date", "bid closing", "deadline"]:
-        return False
-    if opening_date.lower()   in ["opening date", "open date", "bid opening"]:
-        return False
-    if published_date.lower() in ["published date", "e-published date", "publication"]:
-        return False
-    if organisation.lower()   in ["organisation chain", "organization", "department", "ministry"]:
-        return False
-    if len(title) <= 20 or not any(c.isalpha() for c in title):
-        return False
-    tender_keywords = [
-        "supply", "procurement", "tender", "contract", "services", "work",
-        "construction", "equipment", "purchase", "hiring", "repair",
-        "maintenance", "installation", "consultancy",
-    ]
-    return any(kw in title_lower for kw in tender_keywords) or len(title.split()) > 5
-
-
-async def handle_captcha_if_present(page: Page) -> bool:
-    if not SOLVE_CAPTCHA:
-        log_captcha.info("CAPTCHA solving disabled (SOLVE_CAPTCHA=false) — skipping")
-        return True
-
-    log_captcha.info("Checking for CAPTCHA presence...")
-    t0 = time.perf_counter()
-    try:
-        if not await detect_captcha_presence(page):
-            log_captcha.info("No CAPTCHA detected — proceeding")
-            run_summary.record("captcha_solved", False)
-            return True
-
-        log_captcha.warning("CAPTCHA detected — capturing screenshot and solving...")
-        captcha_base64 = await capture_captcha_screenshot(page, enhance=True)
-        if not captcha_base64:
-            log_captcha.error("Failed to capture CAPTCHA screenshot")
-            return False
-
-        solution_result = await solve_captcha_2captcha(captcha_base64)
-        elapsed = time.perf_counter() - t0
-
-        if not solution_result.get("success"):
-            log_captcha.error(f"2Captcha solve failed ({elapsed:.1f}s): {solution_result.get('error', 'Unknown')}")
-            return False
-
-        solution_text = solution_result.get("solution", "")
-        log_captcha.success(f"CAPTCHA solved ({elapsed:.1f}s) — solution={solution_text!r}")
-        run_summary.record("captcha_solved", True)
-        run_summary.record("captcha_time_s", round(elapsed, 1))
-        await page.fill(CAPTCHA_INPUT_SELECTOR, solution_text)
-        return True
-
-    except Exception as e:
-        log_captcha.error(f"CAPTCHA handler exception: {e}")
-        return False
-
-
-async def find_exact_next_button(page: Page) -> Optional[object]:
-    try:
-        for link in await page.query_selector_all("a"):
-            try:
-                text = await link.inner_text()
-                if text.strip() == ">":
-                    html = await link.evaluate("el => el.outerHTML")
-                    if ">>" not in html and text.count(">") == 1:
-                        return link
-            except Exception:
-                continue
-        return None
-    except Exception as e:
-        log_step("Pagination", "error", {"error": str(e)})
-        return None
-
-
-async def extract_live_tenders_count(page: Page) -> Optional[int]:
-    try:
-        for row in reversed(await page.query_selector_all("table tr:has(td)")):
-            try:
-                cells = await row.query_selector_all("td")
-                if len(cells) >= 5:
-                    s_no = (await cells[0].inner_text()).strip().rstrip(".")
-                    if s_no.isdigit():
-                        return int(s_no)
-            except Exception:
-                continue
-        return None
-    except Exception:
-        return None
-
-
-def extract_tenders_from_html(html_content: str) -> List[TenderItem]:
-    """Unchanged — parses list-page HTML into TenderItem list."""
-    tenders = []
-    try:
-        tree = HTMLParser(html_content)
-        # The list page uses id="table" on the results table (confirmed from HTML source)
-        rows = tree.css("table#table tr")
-        if not rows:
-            rows = tree.css("table.list_table tr")
-        if not rows:
-            rows = tree.css("table.list tbody tr")
-        if not rows:
-            log_step("Extraction", "warning", {"message": "No table rows found"})
-            return tenders
-
-        header_keywords = [
-            "s.no", "serial", "published", "closing", "opening",
-            "title", "ref.no", "tender id", "organisation chain",
-        ]
-        start_index = 0
-        for idx in range(min(5, len(rows))):
-            if any(kw in rows[idx].text().lower() for kw in header_keywords):
-                start_index = idx + 1
-            else:
-                break
-
-        for row in rows[start_index:]:
-            row_text = row.text()
-            if not row_text or len(row_text.strip()) < 20:
-                continue
-            cells = row.css("td")
-            if len(cells) < 5:
-                continue
-
-            published_date = cells[1].text().strip()
-            closing_date   = cells[2].text().strip()
-            opening_date   = cells[3].text().strip()
-            title_and_ref  = cells[4].text().strip()
-            organisation   = cells[5].text().strip() if len(cells) > 5 else ""
-
-            title, ref_no = parse_title_and_ref(title_and_ref)
-
-            # Find the link that carries the sp= session token — not the
-            # Tapestry component links ($DirectLink, $DirectLink_0, etc.)
-            tender_url = None
-            for link in cells[4].css("a"):
-                href = link.attributes.get("href", "")
-                if "sp=" in href:
-                    tender_url = (
-                        f"https://eprocure.gov.in{href}"
-                        if not href.startswith("http") else href
-                    )
-                    break
-
-            if not is_valid_tender(title, closing_date, opening_date,
-                                   published_date, organisation):
-                continue
-
-            tenders.append(TenderItem(
-                title=title,
-                ref_no=ref_no,
-                closing_date=closing_date,
-                opening_date=opening_date,
-                published_date=published_date,
-                organisation=organisation,
-                url=tender_url,
-            ))
-
-    except Exception as e:
-        log_step("Extraction", "error", {"error": str(e)})
-
-    return tenders
-
-
-# ── Detail page parsing (completely rewritten, precision-targeted) ─────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _clean(val: Optional[str]) -> Optional[str]:
-    """Normalise whitespace, reject empty/NA/JS-looking values."""
     if not val:
         return None
     val = val.replace("\xa0", " ").strip()
-    if not val or val in ("NA", "N/A", "-", "&nbsp;"):
-        return None
-    # Safety net: reject anything that looks like JS leaked through
-    if "function" in val or "window.open" in val or len(val) > 600:
+    if not val or val.upper() in ("NA", "N/A", "-", "--", "NIL"):
         return None
     return val
 
@@ -348,410 +82,527 @@ def _parse_int(val: Optional[str]) -> Optional[int]:
     return int(m.group()) if m else None
 
 
-def _sibling_value(caption_node, offset: int = 1) -> Optional[str]:
-    """
-    Given a <td class="td_caption"> Selectolax node, return the cleaned text
-    of the td that is `offset` siblings after it within the same <tr>.
+def _parse_total_count(html: str) -> Optional[int]:
+    """Extract 'Total Tenders : 34233' from the listing page."""
+    tree = HTMLParser(html)
+    for node in tree.css("div, span, p, td, strong"):
+        text = node.text(strip=True)
+        m = re.search(r"Total\s+Tenders\s*[:\-]\s*([\d,]+)", text, re.IGNORECASE)
+        if m:
+            try:
+                return int(m.group(1).replace(",", ""))
+            except ValueError:
+                pass
+    return None
 
-    This works because the site always lays out rows as:
-        [caption][field][caption][field][caption][field]
-    where each pair shares one <tr>. The field we want is always offset=1
-    from its caption, regardless of how many pairs are in the row.
+
+def _extract_cppp_ref_no(url: str) -> Optional[str]:
     """
-    parent = caption_node.parent  # the <tr>
-    if not parent:
+    Extract stable numeric tender ID from a CPPP detail URL token.
+    The token encodes multiple fields separated by 'A13h1'; the first
+    segment is a base64-encoded numeric database ID for the tender.
+    """
+    try:
+        parts = re.split(r"/cppp/tendersfullview(?:mmp)?/", url)
+        if len(parts) < 2:
+            return None
+        token = parts[1]
+        first = token.split("A13h1")[0]
+        padding = (4 - len(first) % 4) % 4
+        decoded = base64.b64decode(first + "=" * padding).decode("ascii", errors="ignore")
+        m = re.search(r"\d{4,}", decoded)
+        return m.group() if m else None
+    except Exception:
         return None
-    all_tds = parent.css("td")
-    for i, td in enumerate(all_tds):
-        # Node identity comparison via their HTML
-        if td.html == caption_node.html:
-            target = i + offset
-            if target < len(all_tds):
-                return _clean(all_tds[target].text(strip=True))
-    return None
 
 
-def _find_caption_in_content(tree: HTMLParser, label: str) -> Optional[object]:
+# ── Listing page parser ───────────────────────────────────────────────────────
+
+def parse_listing_page(html: str, source: str) -> List[Dict]:
     """
-    Find the first <td class="td_caption"> whose text contains `label`,
-    searching ONLY inside <table class="tablebg"> elements.
+    Parse one page of a CPPP listing.
 
-    Why tablebg? The detail page has:
-      - Left sidebar <td class="navigation"> with a <script> popup() function
-      - Content area tables that all carry class="tablebg"
-    Scoping to tablebg completely eliminates sidebar/script contamination.
+    Expected columns:
+      Sl.No | e-Published Date | Bid Closing Date | Opening Date |
+      Title/Ref.No./Tender Id | Organisation (central) / State (state) | Corrigendum
+
+    Returns list of tender dicts.
     """
-    label_lower = label.lower().strip()
-    for table in tree.css("table.tablebg"):
-        for td in table.css("td.td_caption"):
-            if label_lower in td.text(strip=True).lower():
-                return td
-    return None
+    tree = HTMLParser(html)
+    tenders = []
 
+    # Find the main data table — must have at least 6 columns and header keywords
+    target_table = None
+    for table in tree.css("table"):
+        header_text = table.text(strip=True).lower()
+        if "published" in header_text and (
+            "closing" in header_text
+            or "organisation" in header_text
+            or "state" in header_text
+        ):
+            target_table = table
+            break
+
+    if not target_table:
+        log_scraper.warning(f"[{source}] No listing table found on page")
+        return []
+
+    rows = target_table.css("tbody tr") or target_table.css("tr")
+    for row in rows:
+        cells = row.css("td")
+        if len(cells) < 5:
+            continue
+
+        published_date = _clean(cells[1].text(strip=True))
+        closing_date   = _clean(cells[2].text(strip=True))
+        opening_date   = _clean(cells[3].text(strip=True))
+
+        title_cell = cells[4]
+        link       = title_cell.css_first("a")
+
+        detail_url = None
+        title_text = None
+
+        if link:
+            href = link.attributes.get("href", "")
+            if href:
+                detail_url = (
+                    f"{CPPP_BASE_URL}{href}" if not href.startswith("http") else href
+                )
+            title_text = _clean(link.text(strip=True))
+
+        if not title_text:
+            title_text = _clean(title_cell.text(strip=True))
+        if not title_text:
+            continue
+
+        # Skip header rows
+        if any(kw in title_text.lower() for kw in
+               ["title", "tender id", "ref.no", "s.no", "serial no"]):
+            continue
+
+        org_or_state = _clean(cells[5].text(strip=True)) if len(cells) > 5 else None
+
+        # Derive stable ref_no from the detail URL token
+        ref_no = None
+        if detail_url:
+            ref_no = _extract_cppp_ref_no(detail_url)
+        if not ref_no:
+            # Fall back to title text — it is typically the official file/tender number
+            ref_no = title_text
+
+        tenders.append({
+            "source":         source,
+            "title":          title_text,
+            "ref_no":         ref_no,
+            "published_date": published_date,
+            "closing_date":   closing_date,
+            "opening_date":   opening_date,
+            "organisation":   org_or_state,
+            "url":            detail_url,
+        })
+
+    return tenders
+
+
+# ── Detail page parser ────────────────────────────────────────────────────────
 
 def parse_detail_page(html: str) -> Dict:
     """
-    Parse a tender detail page. Returns dict of all non-None scraped fields.
-
-    All lookups are scoped to table.tablebg to avoid sidebar contamination.
+    Parse a CPPP tender detail page.
+    Builds a label→value map from all table rows (th/td and td/td patterns)
+    then maps known field names to our schema.
+    Returns dict of non-None fields only.
     """
-    tree   = HTMLParser(html)
-    result = {}
+    tree = HTMLParser(html)
 
-    def get(label: str, offset: int = 1) -> Optional[str]:
-        td = _find_caption_in_content(tree, label)
-        return _sibling_value(td, offset) if td else None
+    # Abort on error pages
+    body = tree.css_first("body")
+    if body and "invalid url" in body.text(strip=True).lower():
+        return {}
 
-    # ── Basic Details section ─────────────────────────────────────────────────
-    result["tender_id"]       = get("Tender ID")
-    result["tender_type"]     = get("Tender Type")
-    result["tender_category"] = get("Tender Category")
-    # Confirmed label in source: "Form Of Contract" (capital O)
-    result["contract_type"]   = get("Form Of Contract") or get("Form of contract")
+    label_map: Dict[str, str] = {}
 
-    # ── Work Item Details section ─────────────────────────────────────────────
-    result["work_description"] = get("Work Description")
+    for table in tree.css("table"):
+        for row in table.css("tr"):
+            ths = row.css("th")
+            tds = row.css("td")
 
-    # Tender Value row (label contains "Tender Value in" + ₹ entity)
-    # Confirmed structure: td_caption="Tender Value in ₹ " → td_field="3,86,15,626"
-    # We match on "tender value in" prefix to handle encoding differences
-    tv_td = _find_caption_in_content(tree, "Tender Value in")
-    if tv_td:
-        result["tender_value"] = _parse_amount(_sibling_value(tv_td, 1))
+            # th→td pairs
+            if ths and tds:
+                for i, th in enumerate(ths):
+                    label = _clean(th.text(strip=True))
+                    if label and i < len(tds):
+                        val = _clean(tds[i].text(strip=True))
+                        if val:
+                            label_map[label.lower()] = val
 
-    # Product Category, Sub category — same row as Tender Value
-    result["product_category"] = get("Product Category")
-    result["sub_category"]     = get("Sub category")
+            # td→td pairs where first td looks like a label
+            if len(tds) >= 2:
+                for i in range(0, len(tds) - 1, 2):
+                    cls = (tds[i].attributes.get("class") or "").lower()
+                    if any(k in cls for k in ("label", "caption", "key", "head")):
+                        label = _clean(tds[i].text(strip=True))
+                        val   = _clean(tds[i + 1].text(strip=True))
+                        if label and val:
+                            label_map[label.lower()] = val
 
-    # Contract Type / Bid Validity / Period of Work — same row
-    result["bid_validity_days"]   = _parse_int(get("Bid Validity"))
-    result["period_of_work_days"] = _parse_int(get("Period Of Work"))
+    def get(*searches: str) -> Optional[str]:
+        for s in searches:
+            s_lower = s.lower()
+            for key, val in label_map.items():
+                if s_lower in key:
+                    return val
+        return None
 
-    # Location / Pincode / Pre Bid Meeting Place — same row
-    result["location"] = get("Location")
-    result["pincode"]  = get("Pincode")
+    result: Dict = {}
+    result["tender_id"]          = get("tender id", "tender no", "nit no", "ref no")
+    result["tender_type"]        = get("tender type")
+    result["tender_category"]    = get("tender category", "category")
+    result["contract_type"]      = get("form of contract", "contract type")
+    result["work_description"]   = get("work description", "description of work", "name of work")
+    result["product_category"]   = get("product category")
+    result["sub_category"]       = get("sub category", "sub-category")
+    result["location"]           = get("location", "place of work", "district")
+    result["pincode"]            = get("pincode", "pin code")
+    result["organisation"]       = get("organisation", "organization", "department", "ministry")
+    result["state"]              = get("state name", "state")
+    result["tender_value"]       = _parse_amount(get("tender value", "estimated cost", "nit amount"))
+    result["emd_amount"]         = _parse_amount(get("emd amount", "earnest money", "bid security"))
+    result["period_of_work_days"] = _parse_int(get("period of work", "completion period"))
+    result["bid_validity_days"]   = _parse_int(get("bid validity"))
+    result["pre_bid_meeting_date"]        = get("pre bid meeting date", "pre-bid meeting")
+    result["inviting_authority_name"]     = get("inviting authority", "name")
+    result["inviting_authority_address"]  = get("address")
 
-    # Pre Bid Meeting Date
-    result["pre_bid_meeting_date"] = get("Pre Bid Meeting Date")
-
-    # ── EMD Fee Details section ───────────────────────────────────────────────
-    # Label: "EMD Amount in ₹" — match on prefix
-    emd_td = _find_caption_in_content(tree, "EMD Amount in")
-    if emd_td:
-        result["emd_amount"] = _parse_amount(_sibling_value(emd_td, 1))
-
-    # ── Tender Inviting Authority section ─────────────────────────────────────
-    # "Name" and "Address" labels exist here — both are <td class="td_caption">
-    # inside a tablebg table at the bottom of the page
-    result["inviting_authority_name"]    = get("Name")
-    result["inviting_authority_address"] = get("Address")
-
-    # Return only fields that have a real value
     return {k: v for k, v in result.items() if v is not None}
 
 
-# ── Main scraping pipeline ────────────────────────────────────────────────────
+# ── HTTP helpers ──────────────────────────────────────────────────────────────
 
-async def scrape_listing_pages(
-    max_pages: Optional[int] = None,
-    already_detailed: Optional[set] = None,
+async def _get_page(url: str, client: httpx.AsyncClient) -> Optional[str]:
+    """
+    Fetch URL with retry + exponential backoff.
+    Handles server disconnects, timeouts, and 429 rate-limits.
+    Returns HTML text or None after all retries are exhausted.
+    """
+    for attempt in range(REQUEST_RETRIES):
+        try:
+            resp = await client.get(url, timeout=REQUEST_TIMEOUT, follow_redirects=True)
+
+            if resp.status_code == 200:
+                return resp.text
+
+            if resp.status_code == 429:
+                delay = 10 * (2 ** attempt)
+                log_scraper.warning(f"429 rate-limited — backing off {delay}s ({url[:60]})")
+                await asyncio.sleep(delay)
+                continue
+
+            log_scraper.warning(f"HTTP {resp.status_code} for {url[:70]}")
+            return None
+
+        except (httpx.TimeoutException, httpx.NetworkError,
+                httpx.RemoteProtocolError, httpx.ConnectError) as exc:
+            if attempt < REQUEST_RETRIES - 1:
+                delay = 3 * (2 ** attempt)   # 3s, 6s, 12s
+                log_scraper.warning(
+                    f"Connection error (attempt {attempt + 1}/{REQUEST_RETRIES}), "
+                    f"retry in {delay}s — {type(exc).__name__} on {url[:60]}"
+                )
+                await asyncio.sleep(delay)
+            else:
+                log_scraper.warning(
+                    f"Gave up after {REQUEST_RETRIES} attempts — {url[:60]}"
+                )
+                return None
+
+    return None
+
+
+# ── Helpers for live tender logging ──────────────────────────────────────────
+
+def _log_tenders(tenders: List[Dict], source: str, known: Set[str]) -> None:
+    """Log one line per tender as it arrives — visible in real-time Docker logs."""
+    for t in tenders:
+        is_new = not known or t.get("ref_no") not in known
+        flag   = "NEW" if is_new else "   "
+        title  = (t.get("title") or "")[:55]
+        org    = (t.get("organisation") or "—")[:28]
+        closes = t.get("closing_date") or "?"
+        log_scraper.debug(f"[{source}] {flag}  {title:<55}  {org:<28}  closes {closes}")
+
+
+# ── Listing scraper ───────────────────────────────────────────────────────────
+
+async def scrape_listing(
+    source: str,
+    client: httpx.AsyncClient,
+    known_ref_nos: Optional[Set[str]] = None,
     early_stop_pages: int = 3,
     on_page: Optional[Callable[[List[Dict]], Awaitable[None]]] = None,
 ) -> Dict:
     """
-    Phase 1 of the hybrid pipeline: scrape listing pages only.
+    Scrape all pages of a CPPP listing in parallel.
 
-    Handles CAPTCHA, form submission, and pagination. Does NOT click into
-    any detail pages. Each TenderItem is returned with only its 7 list-page
-    fields populated:
-        title, ref_no, closing_date, opening_date, published_date,
-        organisation, url
+    Page 0 is fetched first to discover the total page count, then all
+    remaining pages are fanned out concurrently (LISTING_PAGE_CONCURRENCY).
+    Results are processed via asyncio.as_completed() so checkpoint writes
+    and live logs happen as each page lands — not after all pages finish.
 
-    The url field contains the detail page URL (with sp= session token) that
-    Phase 2 (cloudflare_crawl.py) will use for bulk detail extraction.
+    Early stopping still works: a sorted buffer tracks consecutive pages
+    where every ref_no is already in the DB; once `early_stop_pages`
+    consecutive pages are fully known, remaining fetches are cancelled.
 
     Args:
-        max_pages:        Override the MAX_PAGES env var limit. Defaults to MAX_PAGES.
-        already_detailed: Set of ref_nos already fully stored in Supabase. When
-                          provided, pagination stops early after `early_stop_pages`
-                          consecutive pages where every tender is already known.
-                          Tenders are listed newest-first, so a full page of known
-                          ref_nos means we've passed the frontier of new data.
-        early_stop_pages: Number of all-known consecutive pages before stopping.
-        on_page:          Optional async callback called immediately after each page
-                          is extracted, receiving the page's tender dicts. Use this
-                          for per-page checkpoint writes to Supabase so a crash
-                          mid-scrape doesn't lose already-scraped pages.
+        source:           "central" or "state"
+        client:           Shared httpx.AsyncClient (also used for detail pages)
+        known_ref_nos:    ref_nos already in DB
+        early_stop_pages: Cancel remaining fetches after this many consecutive
+                          all-known pages (in page-number order)
+        on_page:          Async checkpoint callback per page
 
     Returns:
-        {
-            "success":      bool,
-            "tenders":      List[Dict],
-            "total_pages":  int,
-            "live_tenders": Optional[int],
-            "error":        Optional[str],
-        }
+        {"success": bool, "tenders": List[Dict], "total_pages": int,
+         "total_count": Optional[int], "error": Optional[str]}
     """
-    page_limit      = max_pages if max_pages is not None else MAX_PAGES
-    known           = already_detailed or set()
-    all_known_streak = 0
-    log_step("Listing Scraper", "initiated",
-             {"framework": "Playwright + 2Captcha + Selectolax",
-              "max_pages": page_limit,
-              "known_detailed": len(known)})
+    base_url = SOURCES[source]
+    known    = known_ref_nos or set()
 
-    tenders_list: List[TenderItem] = []
-    current_page = 0
-    total_live   = None
+    # ── Page 0: discover total page count ────────────────────────────────────
+    html = await _get_page(f"{base_url}?page=0", client)
+    if not html:
+        return {
+            "success": False,
+            "error":   f"Failed to fetch {source} listing page 0",
+            "tenders": [], "total_pages": 0,
+        }
 
-    try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--disable-blink-features=AutomationControlled",
-                ],
-            )
-            context = await browser.new_context(
-                viewport={"width": 1280, "height": 720},
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                ),
-            )
-            page = await context.new_page()
+    total_count   = _parse_total_count(html)
+    page_0_tender = parse_listing_page(html, source)
 
-            # STEP 1: Load search form
-            log_scraper.info(f"Navigating to Advanced Search — {ADVANCED_SEARCH_URL}")
-            t_nav = time.perf_counter()
-            await page.goto(ADVANCED_SEARCH_URL, wait_until="networkidle",
-                            timeout=PAGE_TIMEOUT)
-            await page.wait_for_selector(CAPTCHA_INPUT_SELECTOR, timeout=10000)
-            log_scraper.info(f"Search form loaded ({time.perf_counter()-t_nav:.2f}s)")
+    _log_tenders(page_0_tender, source, known)
+    if on_page and page_0_tender:
+        try:
+            await on_page(page_0_tender)
+        except Exception as e:
+            log_scraper.warning(f"[{source}] on_page failed (page 0): {e}")
 
-            # STEP 2: Solve CAPTCHA
-            if not await handle_captcha_if_present(page):
-                await browser.close()
-                log_scraper.error("CAPTCHA solving failed — aborting scrape")
-                return {"success": False, "error": "CAPTCHA solving failed",
-                        "tenders": [], "total_pages": 0}
-
-            # STEP 3: Select tender type and submit
-            for sel in TENDER_TYPE_SELECTORS:
-                try:
-                    el = await page.query_selector(sel)
-                    if el:
-                        await page.select_option(sel, value="1")
-                        log_scraper.info("Tender type set to 'Open Tender' (value=1)")
-                        break
-                except Exception:
-                    continue
-
-            log_scraper.info("Submitting search form...")
-            t_submit = time.perf_counter()
-            await page.click(SUBMIT_BUTTON_SELECTOR)
-            await page.wait_for_load_state("networkidle", timeout=PAGE_TIMEOUT)
-            log_scraper.info(f"Search results loaded ({time.perf_counter()-t_submit:.2f}s)")
-
-            # STEP 4: Paginate and extract list-page fields only
-            while True:
-                current_page += 1
-                t_page = time.perf_counter()
-                html         = await page.content()
-                page_tenders = extract_tenders_from_html(html)
-                page_time    = time.perf_counter() - t_page
-
-                # Early-stop: count consecutive pages where every valid ref_no
-                # is already fully stored in Supabase. Tenders are sorted
-                # newest-first, so once we're deep into known territory we can stop.
-                if known and page_tenders:
-                    valid_ref_nos = [
-                        t.ref_no for t in page_tenders
-                        if t.ref_no and t.ref_no != "UNKNOWN"
-                    ]
-                    new_on_page = [r for r in valid_ref_nos if r not in known]
-                    if valid_ref_nos and all(r in known for r in valid_ref_nos):
-                        all_known_streak += 1
-                        log_scraper.debug(
-                            f"Page {current_page}: {len(page_tenders)} tenders, "
-                            f"all known (streak={all_known_streak}/{early_stop_pages}) "
-                            f"[{page_time:.2f}s]"
-                        )
-                    else:
-                        all_known_streak = 0
-                        log_scraper.info(
-                            f"Page {current_page}: {len(page_tenders)} tenders — "
-                            f"{len(new_on_page)} new, {len(valid_ref_nos)-len(new_on_page)} known "
-                            f"(running total: {len(tenders_list)+len(page_tenders)}) [{page_time:.2f}s]"
-                        )
-                else:
-                    log_scraper.info(
-                        f"Page {current_page}: {len(page_tenders)} tenders "
-                        f"(running total: {len(tenders_list)+len(page_tenders)}) [{page_time:.2f}s]"
-                    )
-
-                if known and all_known_streak >= early_stop_pages:
-                    log_scraper.warning(
-                        f"Early stop triggered — {early_stop_pages} consecutive pages of already-known tenders "
-                        f"(page {current_page}, total so far: {len(tenders_list)+len(page_tenders)})"
-                    )
-                    tenders_list.extend(page_tenders)
-                    if on_page and page_tenders:
-                        await on_page([t.to_dict() for t in page_tenders])
-                    run_summary.record("early_stop_triggered", True)
-                    break
-
-                # Checkpoint write — persist this page immediately before moving on
-                if on_page and page_tenders:
-                    try:
-                        await on_page([t.to_dict() for t in page_tenders])
-                    except Exception as cb_exc:
-                        log_scraper.warning(f"on_page callback failed (page {current_page}): {cb_exc} — continuing")
-
-                tenders_list.extend(page_tenders)
-
-                if current_page >= page_limit:
-                    log_scraper.info(f"Reached max_pages limit ({page_limit})")
-                    break
-
-                next_btn = await find_exact_next_button(page)
-                if not next_btn:
-                    log_scraper.info(f"No more pages — pagination complete at page {current_page}")
-                    break
-
-                await next_btn.click()
-                try:
-                    await page.wait_for_load_state("domcontentloaded", timeout=10000)
-                except Exception:
-                    try:
-                        await page.wait_for_selector(
-                            "table#table, table.list_table", timeout=15000)
-                    except Exception:
-                        pass
-
-                await asyncio.sleep(2)
-
-            # STEP 5: Count live tenders
-            total_live = await extract_live_tenders_count(page)
-            if total_live:
-                log_scraper.info(f"Portal reports {total_live:,} live tenders total")
-
-            await browser.close()
-
-        log_scraper.success(
-            f"Listing scrape complete — {len(tenders_list):,} tenders across {current_page} pages "
-            f"(live_count={total_live or 'N/A'}, early_stop={all_known_streak >= early_stop_pages})"
+    if not total_count:
+        # Rare: can't determine total — fall back to sequential
+        log_scraper.warning(f"[{source}] Total count unknown — using sequential fallback")
+        return await _scrape_sequential(
+            source, client, known, early_stop_pages, on_page, page_0_tender
         )
 
-        return {
-            "success":               True,
-            "tenders":               [t.to_dict() for t in tenders_list],
-            "total_pages":           current_page,
-            "live_tenders":          total_live,
-            "early_stop_triggered":  all_known_streak >= early_stop_pages,
-        }
+    total_pages = (total_count + 9) // 10
+    log_scraper.info(
+        f"[{source}] {total_count:,} tenders, ~{total_pages} pages — "
+        f"parallel fetch (concurrency={LISTING_PAGE_CONCURRENCY})"
+    )
 
-    except Exception as e:
-        log_scraper.exception(f"Listing scraper crashed: {e}")
-        return {
-            "success":              False,
-            "error":                str(e),
-            "tenders":              [t.to_dict() for t in tenders_list],
-            "total_pages":          current_page,
-            "early_stop_triggered": False,
-        }
+    # ── Fan out remaining pages ───────────────────────────────────────────────
+    sem        = asyncio.Semaphore(LISTING_PAGE_CONCURRENCY)
+    stop_event = asyncio.Event()
 
+    async def _fetch(pn: int) -> Tuple[int, List[Dict]]:
+        if stop_event.is_set():
+            return pn, []
+        async with sem:
+            if stop_event.is_set():
+                return pn, []
+            try:
+                html = await _get_page(f"{base_url}?page={pn}", client)
+                return pn, (parse_listing_page(html, source) if html else [])
+            except Exception as exc:
+                log_scraper.warning(f"[{source}] Page {pn} unexpected error: {exc}")
+                return pn, []
 
-# Backward-compat alias used by main.py
-async def scrape_tenders_crawl4ai_playwright() -> Dict:
-    """Alias for scrape_listing_pages(). Kept for backward compatibility."""
-    return await scrape_listing_pages()
+    tasks = [asyncio.create_task(_fetch(pn)) for pn in range(1, total_pages)]
 
+    all_tenders  = list(page_0_tender)
+    pages_done   = 0
+    active       = 0   # tasks currently inside the semaphore
+    # Buffer for ordered early-stop check (pages arrive out of order)
+    buf: Dict[int, List[Dict]] = {}
+    next_check = 1
+    streak     = 0
 
-# ── Latest active tenders (listing only, no CAPTCHA) ─────────────────────────
+    for coro in asyncio.as_completed(tasks):
+        try:
+            pn, tenders = await coro
+        except Exception as exc:
+            log_scraper.warning(f"[{source}] Task raised unexpectedly: {exc}")
+            pages_done += 1
+            continue
 
-async def scrape_latest_active_tenders() -> Dict:
-    """
-    Scrape latest active tenders page (no CAPTCHA required).
+        pages_done += 1
+        # active = tasks queued or running (not yet returned)
+        active = len(tasks) - pages_done
 
-    Returns only list-page fields. Detail extraction is handled by
-    cloudflare_crawl.crawl_detail_pages() in the cron pipeline.
-    """
-    log_step("Latest Tenders Scraper", "initiated", {"url": LATEST_TENDERS_URL})
-
-    tenders_list: List[TenderItem] = []
-    current_page = 0
-
-    try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-setuid-sandbox",
-                      "--disable-dev-shm-usage", "--disable-gpu"],
-            )
-            context = await browser.new_context(
-                viewport={"width": 1280, "height": 720},
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            )
-            page    = await context.new_page()
-
-            await page.goto(LATEST_TENDERS_URL, wait_until="networkidle",
-                            timeout=PAGE_TIMEOUT)
-            current_page = 1
-
-            while True:
-                html         = await page.content()
-                page_tenders = extract_tenders_from_html(html)
-
-                log_step("Page Extraction", "success", {
-                    "page": current_page, "tenders": len(page_tenders),
-                })
-
-                tenders_list.extend(page_tenders)
-
-                if current_page >= MAX_PAGES:
-                    break
-
-                next_btn = await find_exact_next_button(page)
-                if not next_btn:
-                    break
-
-                await next_btn.click()
+        if tenders:
+            _log_tenders(tenders, source, known)
+            if on_page:
                 try:
-                    await page.wait_for_load_state("domcontentloaded", timeout=10000)
-                except Exception:
-                    try:
-                        await page.wait_for_selector(
-                            "table#table, table.list_table", timeout=15000)
-                    except Exception:
-                        pass
+                    await on_page(tenders)
+                except Exception as e:
+                    log_scraper.warning(f"[{source}] on_page failed (page {pn}): {e}")
+            all_tenders.extend(tenders)
 
-                await asyncio.sleep(2)
-                current_page += 1
+        # Progress line every 25 pages
+        if pages_done % 25 == 0 or pages_done == total_pages - 1:
+            pct = pages_done / max(total_pages - 1, 1) * 100
+            log_scraper.info(
+                f"[{source}]  page {pn:>5}  |  {pages_done}/{total_pages - 1} done "
+                f"({pct:.0f}%)  |  {active} in-flight  |  "
+                f"{len(all_tenders):,} tenders collected"
+            )
 
-            await browser.close()
+        # Early-stop: drain the ordered buffer to check consecutive known pages
+        if known:
+            buf[pn] = tenders
+            while next_check in buf:
+                pt    = buf.pop(next_check)
+                valid = [t for t in pt if t.get("ref_no") and t["ref_no"] != "UNKNOWN"]
+                if valid and all(t["ref_no"] in known for t in valid):
+                    streak += 1
+                else:
+                    streak = 0
 
-        log_step("Latest Tenders Scraper", "success", {
-            "total_tenders": len(tenders_list),
-            "total_pages":   current_page,
-        })
+                if streak >= early_stop_pages:
+                    log_scraper.warning(
+                        f"[{source}] Early stop — {early_stop_pages} consecutive "
+                        f"all-known pages at page {next_check} "
+                        f"({len(all_tenders):,} tenders)"
+                    )
+                    stop_event.set()
+                    run_summary.record(f"early_stop_{source}", True)
+                    break
+                next_check += 1
 
-        return {
-            "success":     True,
-            "tenders":     [t.to_dict() for t in tenders_list],
-            "total_pages": current_page,
-        }
+    for t in tasks:
+        t.cancel()
 
-    except Exception as e:
-        log_step("Latest Tenders Scraper", "error", {"error": str(e)})
-        return {
-            "success":     False,
-            "error":       str(e),
-            "tenders":     [t.to_dict() for t in tenders_list],
-            "total_pages": current_page,
-        }
+    log_scraper.success(
+        f"[{source}] Done — {len(all_tenders):,} tenders, {pages_done} pages fetched"
+    )
+    run_summary.record(f"listing_tenders_{source}", len(all_tenders))
+    run_summary.record(f"listing_pages_{source}", pages_done)
+
+    return {
+        "success":     True,
+        "tenders":     all_tenders,
+        "total_pages": pages_done,
+        "total_count": total_count,
+    }
+
+
+async def _scrape_sequential(
+    source: str,
+    client: httpx.AsyncClient,
+    known: Set[str],
+    early_stop_pages: int,
+    on_page: Optional[Callable],
+    initial_tenders: List[Dict],
+) -> Dict:
+    """Sequential fallback used when total_count is unavailable from page 0."""
+    all_tenders = list(initial_tenders)
+    streak  = 0
+    page_num = 1
+
+    while True:
+        html = await _get_page(f"{SOURCES[source]}?page={page_num}", client)
+        if not html:
+            break
+
+        tenders = parse_listing_page(html, source)
+        if not tenders:
+            break
+
+        _log_tenders(tenders, source, known)
+        if on_page:
+            try:
+                await on_page(tenders)
+            except Exception as e:
+                log_scraper.warning(f"[{source}] on_page failed (page {page_num}): {e}")
+
+        all_tenders.extend(tenders)
+
+        if known:
+            valid = [t for t in tenders if t.get("ref_no") and t["ref_no"] != "UNKNOWN"]
+            if valid and all(t["ref_no"] in known for t in valid):
+                streak += 1
+                if streak >= early_stop_pages:
+                    run_summary.record(f"early_stop_{source}", True)
+                    break
+            else:
+                streak = 0
+
+        page_num += 1
+
+    run_summary.record(f"listing_tenders_{source}", len(all_tenders))
+    run_summary.record(f"listing_pages_{source}", page_num)
+    return {
+        "success": True, "tenders": all_tenders,
+        "total_pages": page_num, "total_count": None,
+    }
+
+
+# ── Detail page fetcher ───────────────────────────────────────────────────────
+
+async def _fetch_one_detail(
+    url: str,
+    ref_no: str,
+    client: httpx.AsyncClient,
+    sem: asyncio.Semaphore,
+) -> Tuple[str, str, Dict]:
+    """Fetch and parse one detail page. Returns (url, ref_no, fields)."""
+    async with sem:
+        html = await _get_page(url, client)
+        if not html:
+            return url, ref_no, {}
+        fields = parse_detail_page(html)
+        if fields:
+            val = fields.get("tender_value")
+            val_str = f"₹{val:,.0f}" if val else "value=?"
+            cat = (fields.get("product_category") or fields.get("tender_category") or "—")[:22]
+            loc = (fields.get("location") or "—")[:20]
+            log_scraper.debug(
+                f"[detail]  {ref_no[:38]:<38}  {val_str:<14}  {cat:<22}  {loc}"
+            )
+        else:
+            log_scraper.debug(f"[detail]  {ref_no[:38]}  (no fields)")
+        return url, ref_no, fields
+
+
+async def fetch_all_details(
+    url_to_ref: Dict[str, str],
+    client: httpx.AsyncClient,
+) -> Dict[str, Dict]:
+    """
+    Concurrently fetch all detail pages using the same AsyncClient.
+    Session cookies from the listing scrape are preserved automatically.
+
+    Returns: {ref_no: fields_dict}
+    """
+    if not url_to_ref:
+        return {}
+
+    sem   = asyncio.Semaphore(DETAIL_CONCURRENCY)
+    tasks = [
+        _fetch_one_detail(url, ref_no, client, sem)
+        for url, ref_no in url_to_ref.items()
+    ]
+
+    results: Dict[str, Dict] = {}
+    for coro in asyncio.as_completed(tasks):
+        _, ref_no, fields = await coro
+        results[ref_no] = fields
+
+    total_with_data = sum(1 for v in results.values() if v)
+    log_scraper.success(
+        f"Detail fetch done — {total_with_data}/{len(url_to_ref)} had data"
+    )
+    run_summary.record("detail_pages_fetched", len(url_to_ref))
+    run_summary.record("detail_pages_with_data", total_with_data)
+    return results
